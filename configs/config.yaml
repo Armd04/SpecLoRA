@@ -5,13 +5,13 @@
 models:
   # Target model (larger, quantized)
   target:
-    name: "mlx-community/Qwen2.5-7B-Instruct-4bit"
-    # name: "mlx-community/Qwen2.5-3B-Instruct-4bit"  # Alternative smaller target
+    name: "mlx-community/Qwen2.5-3B-Instruct-4bit"  # 3B model - better for 16GB RAM
+    # name: "mlx-community/Qwen2.5-7B-Instruct-4bit"  # 7B model - needs more RAM
     
   # Draft model (smaller, trainable)
   draft:
-    name: "mlx-community/Qwen2.5-0.5B-Instruct-bf16"
-    # name: "mlx-community/Qwen2.5-0.5B-Instruct-4bit"  # Quantized alternative
+    name: "mlx-community/Qwen2.5-0.5B-Instruct-4bit"  # Quantized for lower memory
+    # name: "mlx-community/Qwen2.5-0.5B-Instruct-bf16"  # BF16 alternative
     # name: "mlx-community/Qwen2.5-1.5B-Instruct-4bit"  # Larger draft model
 
 # Speculative Decoding Parameters

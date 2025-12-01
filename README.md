@@ -7,8 +7,8 @@ A high-performance inference system for Apple Silicon that uses speculative deco
 ### What is Speculative Decoding?
 
 Speculative decoding is an inference optimization technique that uses two models:
-- **Target Model**: Large, accurate model (Qwen2.5-7B-Instruct, 4-bit quantized)
-- **Draft Model**: Small, fast model (Qwen2.5-0.5B-Instruct, bf16)
+- **Target Model**: Large, accurate model (Qwen2.5-3B-Instruct, 4-bit quantized)
+- **Draft Model**: Small, fast model (Qwen2.5-0.5B-Instruct, 4-bit quantized)
 
 The algorithm:
 1. Draft model generates K candidate tokens quickly
@@ -122,9 +122,9 @@ All settings are in `configs/config.yaml`:
 # Model Configuration
 models:
   target:
-    name: "mlx-community/Qwen2.5-7B-Instruct-4bit"
+    name: "mlx-community/Qwen2.5-3B-Instruct-4bit"
   draft:
-    name: "mlx-community/Qwen2.5-0.5B-Instruct-bf16"
+    name: "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
 
 # Speculative Decoding
 speculative:
