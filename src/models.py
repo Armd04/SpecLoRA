@@ -12,10 +12,7 @@ from typing import Optional, Tuple, Dict, Any
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm import load, generate
-from mlx_lm.models.cache import make_prompt_cache, KVCache
-from mlx_lm.utils import get_model_path
-from huggingface_hub import snapshot_download
+from mlx_lm import load
 
 logger = logging.getLogger(__name__)
 
@@ -151,18 +148,6 @@ class ModelManager:
             raise RuntimeError("Models not loaded. Call load_models() first.")
         return self.draft_model, self.draft_tokenizer
     
-    def create_kv_cache(self, model: nn.Module) -> KVCache:
-        """
-        Create a KV cache for the given model.
-        
-        Args:
-            model: The model to create cache for
-            
-        Returns:
-            KVCache object for efficient generation
-        """
-        return make_prompt_cache(model)
-    
     def clear_cache(self) -> None:
         """Clear MLX memory cache to free up RAM."""
         mx.metal.clear_cache()
@@ -259,8 +244,8 @@ def sample_token(
 def get_logits(
     model: nn.Module,
     input_ids: mx.array,
-    cache: Optional[KVCache] = None,
-) -> Tuple[mx.array, Optional[KVCache]]:
+    cache: Optional[Any] = None,
+) -> Tuple[mx.array, Optional[Any]]:
     """
     Get logits from a model for the given input.
     
