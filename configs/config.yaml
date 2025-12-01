@@ -1,0 +1,98 @@
+# Speculative Decoding with Adaptive LoRA Configuration
+# Optimized for 16GB RAM MacBook
+
+# Model Configuration
+models:
+  # Target model (larger, quantized)
+  target:
+    name: "mlx-community/Qwen2.5-7B-Instruct-4bit"
+    # name: "mlx-community/Qwen2.5-3B-Instruct-4bit"  # Alternative smaller target
+    
+  # Draft model (smaller, trainable)
+  draft:
+    name: "mlx-community/Qwen2.5-0.5B-Instruct"
+    # name: "mlx-community/Qwen2.5-0.5B-Instruct-4bit"  # Quantized alternative
+
+# Speculative Decoding Parameters
+speculative:
+  # Number of tokens to draft before verification
+  num_draft_tokens: 4
+  
+  # Temperature for sampling (0 = greedy)
+  temperature: 0.7
+  
+  # Top-p sampling threshold
+  top_p: 0.9
+  
+  # Maximum tokens to generate total
+  max_tokens: 256
+  
+  # Acceptance rate threshold (below this = failure case)
+  acceptance_threshold: 0.5
+
+# Training Configuration  
+training:
+  # LoRA hyperparameters (small for 16GB RAM)
+  lora:
+    rank: 8
+    alpha: 16
+    dropout: 0.05
+    # Layers to apply LoRA (use fewer for memory efficiency)
+    target_modules:
+      - "q_proj"
+      - "v_proj"
+  
+  # Training parameters
+  learning_rate: 1.0e-4
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  num_epochs: 3
+  warmup_steps: 10
+  
+  # When to trigger training
+  min_failure_cases: 50
+  max_failure_cases: 100
+  
+  # Replay buffer for successful cases (prevents catastrophic forgetting)
+  replay_buffer_size: 25
+  replay_ratio: 0.2  # 20% of training batch is replay samples
+  
+  # Checkpointing
+  save_every_n_steps: 50
+  checkpoint_dir: "data/checkpoints"
+
+# Data Collection
+data:
+  failures_dir: "data/failures"
+  max_prompt_length: 512
+  max_output_length: 256
+
+# Evaluation
+evaluation:
+  # How often to evaluate acceptance rate
+  eval_every_n_prompts: 25
+  
+  # Test prompts for periodic evaluation
+  test_prompts:
+    - "Explain quantum computing in simple terms."
+    - "Write a Python function to reverse a linked list."
+    - "What are the main causes of climate change?"
+    - "Write a haiku about programming."
+    - "Solve this math problem: If x + 5 = 12, what is x?"
+
+# Logging
+logging:
+  level: "INFO"
+  log_file: "data/training.log"
+  tensorboard_dir: "data/runs"
+  
+# Memory optimization
+memory:
+  # Use gradient checkpointing for training
+  gradient_checkpointing: true
+  
+  # Clear cache frequency (every N generations)
+  cache_clear_frequency: 10
+  
+  # Maximum KV cache size
+  max_kv_cache_tokens: 2048

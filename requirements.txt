@@ -1,0 +1,24 @@
+# MLX Speculative Decoding with Adaptive LoRA
+# Requirements for macOS with Apple Silicon
+
+# Core MLX libraries
+mlx>=0.21.0
+mlx-lm>=0.20.0
+
+# Utilities
+pyyaml>=6.0.1
+tqdm>=4.66.1
+rich>=13.7.0
+
+# Data handling
+numpy>=1.24.0
+
+# Metrics and logging
+tensorboard>=2.15.0
+
+# CLI
+click>=8.1.7
+
+# Hugging Face for tokenizers
+transformers>=4.36.0
+huggingface-hub>=0.20.0
