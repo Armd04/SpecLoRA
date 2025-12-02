@@ -55,7 +55,7 @@ class SpeculativeDecodingSystem:
     def __init__(self, config: Dict[str, Any]):
         """
         Initialize the system with configuration.
-        
+
         Args:
             config: Configuration dictionary
         """
@@ -65,6 +65,7 @@ class SpeculativeDecodingSystem:
         self.data_collector = None
         self.rate_tracker = None
         self._initialized = False
+        self._generation_count = 0  # Track generations for cache clearing
     
     def initialize(self) -> None:
         """Initialize all components."""
@@ -95,6 +96,7 @@ class SpeculativeDecodingSystem:
             draft_model, draft_tokenizer = self.model_manager.get_draft_model()
             
             # Initialize decoder
+            chat_config = self.config.get("chat", {})
             self.decoder = SpeculativeDecoder(
                 target_model=target_model,
                 draft_model=draft_model,
@@ -103,6 +105,9 @@ class SpeculativeDecodingSystem:
                 temperature=self.config["speculative"]["temperature"],
                 top_p=self.config["speculative"]["top_p"],
                 acceptance_threshold=self.config["speculative"]["acceptance_threshold"],
+                chat_template=chat_config.get("template"),
+                system_message=chat_config.get("system_message"),
+                use_tokenizer_chat_template=chat_config.get("use_tokenizer_chat_template", True),
             )
             
             # Initialize data collector
@@ -153,21 +158,30 @@ class SpeculativeDecodingSystem:
             self.initialize()
         
         max_tokens = max_tokens or self.config["speculative"]["max_tokens"]
-        
+
+        # Clear cache periodically to prevent memory accumulation
+        cache_clear_freq = self.config.get("memory", {}).get("cache_clear_frequency", 10)
+        if self._generation_count > 0 and self._generation_count % cache_clear_freq == 0:
+            self.model_manager.clear_cache()
+            logger.debug(f"Cleared cache after {self._generation_count} generations")
+
         # Generate with speculative decoding
         result = self.decoder.generate(
             prompt=prompt,
             max_tokens=max_tokens,
             collect_training_data=collect_data,
         )
-        
+
+        # Increment generation counter
+        self._generation_count += 1
+
         # Track acceptance rate
         self.rate_tracker.add_rate(result.metrics.acceptance_rate)
-        
+
         # Collect data if enabled
         if collect_data:
             should_train = self.data_collector.add_result(result)
-            
+
             if should_train:
                 console.print(
                     "[yellow]Training threshold reached! "

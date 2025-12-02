@@ -13,6 +13,7 @@ from typing import Optional, Tuple, Dict, Any
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm import load
+from mlx.utils import tree_flatten
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +151,7 @@ class ModelManager:
     
     def clear_cache(self) -> None:
         """Clear MLX memory cache to free up RAM."""
-        mx.metal.clear_cache()
+        mx.clear_cache()
         logger.debug("Memory cache cleared")
     
     def get_vocab_size(self) -> int:
@@ -167,7 +168,7 @@ class ModelManager:
             Dictionary with memory estimates in GB
         """
         def count_params(model):
-            return sum(p.size for p in model.parameters().values())
+            return sum(v.size for _, v in tree_flatten(model.parameters()))
         
         target_params = count_params(self.target_model) if self.target_model else 0
         draft_params = count_params(self.draft_model) if self.draft_model else 0
@@ -232,7 +233,7 @@ def sample_token(
         
         # Restore original order
         logits = mx.zeros_like(logits)
-        logits = logits.at[sorted_indices].set(sorted_logits)
+        logits[sorted_indices] = sorted_logits
     
     # Sample from distribution
     probs = mx.softmax(logits)

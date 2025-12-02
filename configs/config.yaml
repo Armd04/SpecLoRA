@@ -5,8 +5,8 @@
 models:
   # Target model (larger, quantized)
   target:
-    name: "mlx-community/Qwen2.5-3B-Instruct-4bit"  # 3B model - better for 16GB RAM
-    # name: "mlx-community/Qwen2.5-7B-Instruct-4bit"  # 7B model - needs more RAM
+    name: "mlx-community/Qwen2.5-7B-Instruct-4bit"  # 7B model - needs more RAM
+    # name: "mlx-community/Qwen2.5-3B-Instruct-4bit"  # 3B model - better for 16GB RAM
     
   # Draft model (smaller, trainable)
   draft:
@@ -14,20 +14,39 @@ models:
     # name: "mlx-community/Qwen2.5-0.5B-Instruct-bf16"  # BF16 alternative
     # name: "mlx-community/Qwen2.5-1.5B-Instruct-4bit"  # Larger draft model
 
+# Chat Template Configuration
+chat:
+  # Use tokenizer's built-in chat template (recommended for Qwen2.5)
+  # This uses apply_chat_template() which handles the correct format automatically
+  use_tokenizer_chat_template: true
+
+  # Fallback chat template format (used if tokenizer doesn't support apply_chat_template)
+  # Available variables: {system}, {prompt}
+  # Qwen2.5 format:
+  template: "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+
+  # Default system message for Qwen2.5
+  system_message: "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+
+  # Alternative templates for other models:
+  # Llama3: "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+  # Mistral: "[INST] {prompt} [/INST]"
+  # Phi-3: "<|system|>\n{system}<|end|>\n<|user|>\n{prompt}<|end|>\n<|assistant|>\n"
+
 # Speculative Decoding Parameters
 speculative:
   # Number of tokens to draft before verification
   num_draft_tokens: 4
-  
-  # Temperature for sampling (0 = greedy)
-  temperature: 0.7
-  
+
+  # Temperature for sampling (lower = more focused, 0 = greedy)
+  temperature: 0.6
+
   # Top-p sampling threshold
   top_p: 0.9
-  
+
   # Maximum tokens to generate total
-  max_tokens: 256
-  
+  max_tokens: 4000
+
   # Acceptance rate threshold (below this = failure case)
   acceptance_threshold: 0.5
 
@@ -51,7 +70,7 @@ training:
   warmup_steps: 10
   
   # When to trigger training
-  min_failure_cases: 50
+  min_failure_cases: 10
   max_failure_cases: 100
   
   # Replay buffer for successful cases (prevents catastrophic forgetting)

@@ -1,28 +1,22 @@
 """
-Speculative Decoding Implementation for MLX
+Speculative Decoding Implementation using MLX-LM
 
-Speculative decoding is an inference optimization technique where:
-1. A small "draft" model generates K candidate tokens quickly
-2. A large "target" model verifies all K tokens in parallel (single forward pass)
-3. Accepted tokens are kept; first rejected token triggers re-sampling
+This module wraps MLX-LM's built-in speculative decoding with tracking
+for acceptance rates, failure cases, and training data collection.
 
-This provides speedups when:
-- Draft model is much faster than target model
-- Draft model has high acceptance rate (agrees with target often)
-
-The key insight is that verifying K tokens in parallel takes roughly the same
-time as generating 1 token, due to GPU parallelism.
+Uses MLX-LM's optimized implementation which includes proper KV caching,
+cache rewinding on rejections, and efficient parallel verification.
 """
 
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Callable
 
 import mlx.core as mx
 import mlx.nn as nn
-
-from .models import sample_token, get_logits
+from mlx_lm import stream_generate, generate as mlx_generate
+from mlx_lm.sample_utils import make_sampler
 
 logger = logging.getLogger(__name__)
 
@@ -113,18 +107,15 @@ class SpeculativeResult:
 
 class SpeculativeDecoder:
     """
-    Implements speculative decoding with acceptance tracking.
-    
-    Algorithm:
-    1. Generate K tokens with draft model
-    2. Run target model on all K+1 positions in parallel
-    3. Compare draft and target predictions:
-       - If draft token matches target: ACCEPT
-       - If draft token differs: REJECT, sample from target
-    4. All tokens after first rejection are discarded
-    5. Repeat until max_tokens or EOS
+    Wrapper around MLX-LM's speculative decoding with tracking and metrics.
+
+    Uses MLX-LM's optimized implementation which properly handles:
+    - KV cache creation and management
+    - Cache rewinding on rejections
+    - Parallel token verification
+    - Memory efficiency
     """
-    
+
     def __init__(
         self,
         target_model: nn.Module,
@@ -134,10 +125,13 @@ class SpeculativeDecoder:
         temperature: float = 0.7,
         top_p: float = 0.9,
         acceptance_threshold: float = 0.5,
+        chat_template: Optional[str] = None,
+        system_message: Optional[str] = None,
+        use_tokenizer_chat_template: bool = True,
     ):
         """
         Initialize the speculative decoder.
-        
+
         Args:
             target_model: Large target model for verification
             draft_model: Small draft model for speculation
@@ -146,6 +140,9 @@ class SpeculativeDecoder:
             temperature: Sampling temperature
             top_p: Nucleus sampling threshold
             acceptance_threshold: Below this = failure case
+            chat_template: Fallback chat template string with {system} and {prompt} placeholders
+            system_message: System message for the chat template
+            use_tokenizer_chat_template: Whether to use tokenizer's apply_chat_template (recommended)
         """
         self.target_model = target_model
         self.draft_model = draft_model
@@ -154,134 +151,68 @@ class SpeculativeDecoder:
         self.temperature = temperature
         self.top_p = top_p
         self.acceptance_threshold = acceptance_threshold
-        
+        self.chat_template = chat_template
+        self.system_message = system_message or "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+        self.use_tokenizer_chat_template = use_tokenizer_chat_template
+
+        # Check if tokenizer supports apply_chat_template
+        self._has_chat_template = hasattr(tokenizer, 'apply_chat_template') and callable(tokenizer.apply_chat_template)
+        if self.use_tokenizer_chat_template and not self._has_chat_template:
+            logger.warning("Tokenizer doesn't support apply_chat_template, falling back to manual template")
+
         # Get EOS token
         self.eos_token_id = tokenizer.eos_token_id
         if self.eos_token_id is None:
             self.eos_token_id = tokenizer.convert_tokens_to_ids("</s>")
-    
-    def _draft_tokens(
-        self,
-        input_ids: mx.array,
-        num_tokens: int,
-    ) -> Tuple[List[int], List[mx.array]]:
+
+    def _create_sampler(self) -> Callable[[mx.array], mx.array]:
         """
-        Generate draft tokens using the small model.
-        
-        Args:
-            input_ids: Current token sequence
-            num_tokens: Number of tokens to draft
-            
+        Create a sampler function that applies temperature and top_p sampling.
+
         Returns:
-            Tuple of (draft_token_ids, draft_logits_list)
+            Callable that takes logits and returns a sampled token
         """
-        draft_tokens = []
-        draft_logits = []
-        current_ids = input_ids
-        
-        for _ in range(num_tokens):
-            # Get logits from draft model
-            logits, _ = get_logits(self.draft_model, current_ids)
-            last_logits = logits[0, -1, :]  # [vocab_size]
-            
-            # Sample token
-            token = sample_token(
-                last_logits,
-                temperature=self.temperature,
-                top_p=self.top_p,
+        return make_sampler(temp=self.temperature, top_p=self.top_p)
+
+    def _format_prompt(self, prompt: str) -> str:
+        """
+        Format the prompt using the appropriate chat template.
+
+        Uses the tokenizer's apply_chat_template if available (recommended for Qwen2.5),
+        otherwise falls back to the manual template.
+
+        Args:
+            prompt: The user's input prompt
+
+        Returns:
+            Formatted prompt string ready for tokenization
+        """
+        # Try to use tokenizer's built-in chat template (recommended)
+        if self.use_tokenizer_chat_template and self._has_chat_template:
+            messages = [
+                {"role": "system", "content": self.system_message},
+                {"role": "user", "content": prompt},
+            ]
+            try:
+                formatted = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                return formatted
+            except Exception as e:
+                logger.warning(f"apply_chat_template failed: {e}, falling back to manual template")
+
+        # Fallback to manual template
+        if self.chat_template:
+            return self.chat_template.format(
+                system=self.system_message,
+                prompt=prompt
             )
-            
-            token_id = token.item()
-            draft_tokens.append(token_id)
-            draft_logits.append(last_logits)
-            
-            # Stop if EOS
-            if token_id == self.eos_token_id:
-                break
-            
-            # Append token for next iteration
-            current_ids = mx.concatenate([
-                current_ids,
-                mx.array([[token_id]])
-            ], axis=1)
-        
-        return draft_tokens, draft_logits
-    
-    def _verify_tokens(
-        self,
-        input_ids: mx.array,
-        draft_tokens: List[int],
-    ) -> Tuple[List[int], int, List[mx.array]]:
-        """
-        Verify draft tokens using the target model.
-        
-        This is the key efficiency: we verify ALL draft tokens in a single
-        forward pass by running the target model on the full sequence.
-        
-        Args:
-            input_ids: Original input sequence (before drafting)
-            draft_tokens: Tokens proposed by draft model
-            
-        Returns:
-            Tuple of (accepted_tokens, num_accepted, target_logits)
-        """
-        if not draft_tokens:
-            return [], 0, []
-        
-        # Create full sequence with draft tokens
-        draft_tensor = mx.array([draft_tokens])
-        full_sequence = mx.concatenate([input_ids, draft_tensor], axis=1)
-        
-        # Run target model on full sequence (parallel verification)
-        target_logits, _ = get_logits(self.target_model, full_sequence)
-        
-        # Verify each draft token
-        accepted_tokens = []
-        target_logits_list = []
-        num_accepted = 0
-        
-        # Starting position: where draft tokens begin
-        start_pos = input_ids.shape[1] - 1
-        
-        for i, draft_token in enumerate(draft_tokens):
-            # Get target's prediction at this position
-            pos = start_pos + i
-            logits_at_pos = target_logits[0, pos, :]
-            target_logits_list.append(logits_at_pos)
-            
-            # Sample what target would have generated
-            target_token = sample_token(
-                logits_at_pos,
-                temperature=self.temperature,
-                top_p=self.top_p,
-            ).item()
-            
-            # Check if draft matches target
-            if draft_token == target_token:
-                accepted_tokens.append(draft_token)
-                num_accepted += 1
-                
-                # Stop if EOS
-                if draft_token == self.eos_token_id:
-                    break
-            else:
-                # Rejection: use target's token instead
-                accepted_tokens.append(target_token)
-                break
-        
-        # If all draft tokens accepted, sample one more from target
-        if num_accepted == len(draft_tokens) and draft_tokens[-1] != self.eos_token_id:
-            final_logits = target_logits[0, -1, :]
-            target_logits_list.append(final_logits)
-            bonus_token = sample_token(
-                final_logits,
-                temperature=self.temperature,
-                top_p=self.top_p,
-            ).item()
-            accepted_tokens.append(bonus_token)
-        
-        return accepted_tokens, num_accepted, target_logits_list
-    
+
+        # Last resort: raw prompt
+        return prompt
+
     def generate(
         self,
         prompt: str,
@@ -289,101 +220,64 @@ class SpeculativeDecoder:
         collect_training_data: bool = True,
     ) -> SpeculativeResult:
         """
-        Generate text using speculative decoding.
-        
+        Generate text using MLX-LM's built-in speculative decoding.
+
         Args:
             prompt: Input prompt text
             max_tokens: Maximum tokens to generate
             collect_training_data: Whether to collect draft/target outputs
-            
+
         Returns:
             SpeculativeResult with generated text and metrics
         """
         start_time = time.time()
         metrics = GenerationMetrics()
-        
-        # Tokenize prompt
-        input_ids = self.tokenizer.encode(prompt, return_tensors="np")
-        input_ids = mx.array(input_ids)
-        
+
         generated_tokens = []
-        draft_all_outputs = [] if collect_training_data else None
-        target_all_outputs = [] if collect_training_data else None
-        
-        while len(generated_tokens) < max_tokens:
-            # Current sequence
-            if generated_tokens:
-                current_ids = mx.concatenate([
-                    input_ids,
-                    mx.array([generated_tokens])[None, :]
-                ], axis=1)
-            else:
-                current_ids = input_ids
-            
-            # Phase 1: Draft K tokens
-            draft_start = time.time()
-            draft_tokens, draft_logits = self._draft_tokens(
-                current_ids,
-                self.num_draft_tokens,
-            )
-            mx.eval(draft_tokens)  # Force evaluation
-            metrics.draft_time_seconds += time.time() - draft_start
-            
-            if not draft_tokens:
-                break
-            
-            metrics.draft_tokens_proposed += len(draft_tokens)
-            
-            # Collect draft outputs for training
-            if collect_training_data:
-                draft_all_outputs.extend(draft_tokens)
-            
-            # Phase 2: Verify with target model
-            verify_start = time.time()
-            accepted, num_accepted, target_logits = self._verify_tokens(
-                current_ids,
-                draft_tokens,
-            )
-            mx.eval(accepted)  # Force evaluation
-            metrics.verify_time_seconds += time.time() - verify_start
-            
-            metrics.draft_tokens_accepted += num_accepted
-            
-            # Calculate step acceptance rate
-            if draft_tokens:
-                step_rate = num_accepted / len(draft_tokens)
-                metrics.step_acceptance_rates.append(step_rate)
-            
-            # Collect target outputs for training
-            if collect_training_data and target_logits:
-                # Sample from target logits to get what target would output
-                for logits in target_logits[:len(draft_tokens)]:
-                    target_token = sample_token(
-                        logits,
-                        temperature=self.temperature,
-                        top_p=self.top_p,
-                    ).item()
-                    target_all_outputs.append(target_token)
-            
-            # Add accepted tokens to output
-            generated_tokens.extend(accepted)
-            metrics.total_tokens_generated += len(accepted)
-            
-            # Check for EOS
-            if accepted and accepted[-1] == self.eos_token_id:
-                break
-        
+        generated_text = ""
+        draft_count = 0
+        accepted_count = 0
+
+        # Format prompt using the appropriate chat template
+        formatted_prompt = self._format_prompt(prompt)
+
+        # Create sampler with temperature and top_p
+        sampler = self._create_sampler()
+
+        # Use MLX-LM's stream_generate with built-in speculative decoding
+        for response in stream_generate(
+            model=self.target_model,
+            tokenizer=self.tokenizer,
+            prompt=formatted_prompt,
+            max_tokens=max_tokens,
+            draft_model=self.draft_model,
+            num_draft_tokens=self.num_draft_tokens,
+            sampler=sampler,
+        ):
+            generated_tokens.append(response.token)
+            generated_text += response.text
+
+            # Track which tokens came from draft model
+            if response.from_draft:
+                accepted_count += 1
+            draft_count += 1
+
         metrics.total_time_seconds = time.time() - start_time
-        
-        # Decode generated text
-        generated_text = self.tokenizer.decode(
-            generated_tokens,
-            skip_special_tokens=True,
-        )
-        
+        metrics.total_tokens_generated = len(generated_tokens)
+        metrics.draft_tokens_accepted = accepted_count
+        metrics.draft_tokens_proposed = draft_count  # Approximation
+
         # Determine if this is a failure case
         is_failure = metrics.acceptance_rate < self.acceptance_threshold
-        
+
+        # Note: We don't collect draft/target outputs in this implementation
+        # since MLX-LM's generator doesn't expose them
+        draft_all_outputs = None if not collect_training_data else []
+        target_all_outputs = None if not collect_training_data else []
+
+        # Clear memory
+        mx.clear_cache()
+
         return SpeculativeResult(
             text=generated_text,
             tokens=generated_tokens,
@@ -401,54 +295,34 @@ class SpeculativeDecoder:
         use_target: bool = True,
     ) -> Tuple[str, float]:
         """
-        Generate text using standard (non-speculative) decoding.
-        
+        Generate text using standard (non-speculative) decoding with MLX-LM.
+
         Useful for comparison/benchmarking.
-        
+
         Args:
             prompt: Input prompt
             max_tokens: Maximum tokens to generate
             use_target: Use target model (True) or draft model (False)
-            
+
         Returns:
             Tuple of (generated_text, time_seconds)
         """
         model = self.target_model if use_target else self.draft_model
-        
+
         start_time = time.time()
-        
-        input_ids = self.tokenizer.encode(prompt, return_tensors="np")
-        input_ids = mx.array(input_ids)
-        
-        generated_tokens = []
-        
-        for _ in range(max_tokens):
-            if generated_tokens:
-                current_ids = mx.concatenate([
-                    input_ids,
-                    mx.array([generated_tokens])[None, :]
-                ], axis=1)
-            else:
-                current_ids = input_ids
-            
-            logits, _ = get_logits(model, current_ids)
-            last_logits = logits[0, -1, :]
-            
-            token = sample_token(
-                last_logits,
-                temperature=self.temperature,
-                top_p=self.top_p,
-            ).item()
-            
-            generated_tokens.append(token)
-            
-            if token == self.eos_token_id:
-                break
-        
+
+        text = mlx_generate(
+            model=model,
+            tokenizer=self.tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            verbose=False,
+        )
+
         elapsed = time.time() - start_time
-        
-        text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        
+
+        mx.clear_cache()
+
         return text, elapsed
 
 
