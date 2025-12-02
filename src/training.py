@@ -349,9 +349,24 @@ class LoRATrainer:
             # Target is what the target model would have generated
             target_tokens = ex.target_output[:max_length - len(prompt_ids)]
             
+            # Skip examples with no target tokens (nothing to learn from)
+            # This happens when prompt is already at or exceeds max_length
+            if len(target_tokens) == 0:
+                continue
+            
             # Input is prompt + target (for teacher forcing)
-            full_input = prompt_ids + target_tokens[:-1]  # Shift right
-            targets = prompt_ids[1:] + target_tokens  # Shift left
+            # Shift right: input is [prompt, target[:-1]]
+            full_input = prompt_ids + target_tokens[:-1]
+            # Shift left: targets are [prompt[1:], target]
+            targets = prompt_ids[1:] + target_tokens
+            
+            # Ensure both sequences have the same length
+            # This should always be true, but verify for safety
+            assert len(full_input) == len(targets), (
+                f"Sequence length mismatch: input={len(full_input)}, "
+                f"targets={len(targets)}, prompt_len={len(prompt_ids)}, "
+                f"target_len={len(target_tokens)}"
+            )
             
             # Pad to max length
             pad_length = max_length - len(full_input)
@@ -364,6 +379,14 @@ class LoRATrainer:
             
             input_ids_list.append(full_input)
             target_ids_list.append(targets)
+        
+        # Handle case where all examples were skipped
+        if len(input_ids_list) == 0:
+            # Return empty arrays with correct shape
+            return (
+                mx.array([], dtype=mx.int32).reshape(0, max_length),
+                mx.array([], dtype=mx.int32).reshape(0, max_length),
+            )
         
         return (
             mx.array(input_ids_list),
@@ -487,6 +510,10 @@ class LoRATrainer:
                 
                 # Prepare batch
                 input_ids, target_ids = self._prepare_batch(batch_examples)
+                
+                # Skip empty batches (can happen if all examples were filtered out)
+                if input_ids.shape[0] == 0:
+                    continue
                 
                 # Training step
                 loss, grads = self._training_step(input_ids, target_ids)
