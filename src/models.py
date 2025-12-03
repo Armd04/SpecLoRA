@@ -168,7 +168,15 @@ class ModelManager:
             Dictionary with memory estimates in GB
         """
         def count_params(model):
-            return sum(v.size for _, v in tree_flatten(model.parameters()))
+            total_params = 0
+            for _, v in tree_flatten(model.parameters()):
+                if hasattr(v, "size"):
+                    # Handle 4-bit quantized weights (packed into uint32)
+                    if v.dtype == mx.uint32:
+                        total_params += v.size * 8
+                    else:
+                        total_params += v.size
+            return total_params
         
         target_params = count_params(self.target_model) if self.target_model else 0
         draft_params = count_params(self.draft_model) if self.draft_model else 0

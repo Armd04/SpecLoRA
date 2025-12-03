@@ -179,15 +179,21 @@ def apply_lora_to_model(
                 logger.debug(f"Applied LoRA to: {full_path}")
     
     # Count original parameters
-    original_params = sum(p.size for p in tree_flatten(model.parameters())[0])
+    original_params = 0
+    for _, p in tree_flatten(model.parameters()):
+        if hasattr(p, "size"):
+            if p.dtype == mx.uint32:
+                original_params += p.size * 8
+            else:
+                original_params += p.size
     
     apply_lora_recursive(model)
     
     # Count LoRA parameters
     lora_params = 0
-    for name, param in tree_flatten(model.parameters())[0]:
-        if "lora" in str(name).lower():
-            lora_params += param.size
+    for _, module in model.named_modules():
+        if isinstance(module, LoRALinear):
+            lora_params += module.lora_A.size + module.lora_B.size
     
     logger.info(
         f"LoRA applied. Original params: {original_params/1e6:.1f}M, "
@@ -538,10 +544,11 @@ class LoRATrainer:
                     )
                     
                     # Gradient clipping
-                    grad_norm = sum(
-                        mx.sum(g ** 2).item()
-                        for g in tree_flatten(accumulated_grads)[0]
-                    ) ** 0.5
+                    grad_sq_sum = 0.0
+                    for _, g in tree_flatten(accumulated_grads):
+                        if hasattr(g, "size"):
+                            grad_sq_sum += mx.sum(g ** 2).item()
+                    grad_norm = grad_sq_sum ** 0.5
                     
                     if grad_norm > self.max_grad_norm:
                         scale = self.max_grad_norm / grad_norm
