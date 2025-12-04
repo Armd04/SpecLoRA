@@ -12,7 +12,7 @@ catastrophic forgetting during training.
 import json
 import logging
 import random
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any, TYPE_CHECKING
@@ -21,6 +21,51 @@ if TYPE_CHECKING:
     from .speculative import SpeculativeResult
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TokenLevelDisagreement:
+    """
+    Captures a single token-level disagreement between draft and target models.
+    
+    Used for targeted training where we focus on specific positions where
+    the draft model failed to predict correctly.
+    """
+    
+    # Position in the generated sequence where disagreement occurred
+    position: int
+    
+    # What the draft model predicted
+    draft_token: int
+    
+    # What the target model chose (ground truth for training)
+    target_token: int
+    
+    # Softmax probability of draft's choice (confidence)
+    draft_confidence: float
+    
+    # Softmax probability of target's choice
+    target_confidence: float
+    
+    # Last N tokens before this position (context for understanding failure)
+    context_tokens: List[int] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return asdict(self)
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TokenLevelDisagreement":
+        """Create from dictionary."""
+        return cls(**data)
+    
+    @property
+    def is_high_confidence_failure(self) -> bool:
+        """
+        Check if this was a high-confidence failure (draft was confident but wrong).
+        These are particularly valuable for training as they indicate systematic errors.
+        """
+        return self.draft_confidence > 0.4
 
 
 @dataclass
@@ -51,14 +96,39 @@ class TrainingExample:
     # Additional metadata
     metadata: Optional[Dict[str, Any]] = None
     
+    # Token-level disagreements (optional, from manual speculative decoding)
+    disagreements: Optional[List[TokenLevelDisagreement]] = None
+    
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
-        return asdict(self)
+        result = asdict(self)
+        # Handle nested dataclasses
+        if self.disagreements is not None:
+            result["disagreements"] = [d.to_dict() for d in self.disagreements]
+        return result
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TrainingExample":
         """Create from dictionary."""
+        # Handle nested disagreements
+        if data.get("disagreements") is not None:
+            data["disagreements"] = [
+                TokenLevelDisagreement.from_dict(d) 
+                for d in data["disagreements"]
+            ]
         return cls(**data)
+    
+    @property
+    def has_detailed_data(self) -> bool:
+        """Check if this example has token-level disagreement data."""
+        return self.disagreements is not None and len(self.disagreements) > 0
+    
+    @property
+    def high_confidence_failures(self) -> List[TokenLevelDisagreement]:
+        """Get disagreements where draft was confident but wrong."""
+        if not self.disagreements:
+            return []
+        return [d for d in self.disagreements if d.is_high_confidence_failure]
 
 
 class DataCollector:
@@ -323,19 +393,105 @@ class DataCollector:
         # Format for instruction tuning
         formatted_data = []
         for ex in training_data:
-            formatted_data.append({
+            item = {
                 "prompt": ex.prompt,
                 "draft_tokens": ex.draft_output,
                 "target_tokens": ex.target_output,
                 "acceptance_rate": ex.acceptance_rate,
-            })
+            }
+            
+            # Include token-level disagreement data if available
+            if ex.has_detailed_data:
+                item["disagreements"] = [d.to_dict() for d in ex.disagreements]
+                item["disagreement_positions"] = [d.position for d in ex.disagreements]
+                item["high_confidence_failure_positions"] = [
+                    d.position for d in ex.high_confidence_failures
+                ]
+            
+            formatted_data.append(item)
         
         with open(output_path, "w") as f:
             for item in formatted_data:
                 f.write(json.dumps(item) + "\n")
         
         logger.info(f"Exported {len(formatted_data)} examples to {output_path}")
+        
+        # Log stats about detailed data
+        detailed_count = sum(1 for ex in training_data if ex.has_detailed_data)
+        if detailed_count > 0:
+            total_disagreements = sum(
+                len(ex.disagreements) for ex in training_data if ex.has_detailed_data
+            )
+            logger.info(
+                f"  {detailed_count} examples with token-level data, "
+                f"{total_disagreements} total disagreements"
+            )
+        
         return str(output_path)
+    
+    def add_detailed_result(
+        self,
+        prompt: str,
+        generated_tokens: List[int],
+        disagreements: List[TokenLevelDisagreement],
+        acceptance_rate: float,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Add a result from manual speculative decoding with token-level details.
+        
+        This method is specifically for results from ManualSpeculativeDecoder
+        which provides detailed disagreement information.
+        
+        Args:
+            prompt: The input prompt
+            generated_tokens: All tokens generated (final output)
+            disagreements: List of token-level disagreements
+            acceptance_rate: Overall acceptance rate
+            metadata: Optional additional metadata
+            
+        Returns:
+            True if training should be triggered
+        """
+        # Create training example with detailed data
+        example = TrainingExample(
+            id=self._generate_id(),
+            prompt=prompt,
+            draft_output=generated_tokens,  # Draft attempted these
+            target_output=generated_tokens,  # Final output (after corrections)
+            acceptance_rate=acceptance_rate,
+            timestamp=datetime.now().isoformat(),
+            is_failure=acceptance_rate < 0.5,  # Consider low acceptance as failure
+            metadata=metadata or {},
+            disagreements=disagreements,
+        )
+        
+        # Always treat examples with disagreements as valuable training data
+        if disagreements:
+            self.failure_cases.append(example)
+            logger.info(
+                f"Added detailed example with {len(disagreements)} disagreements "
+                f"(acceptance: {acceptance_rate:.2%}). "
+                f"Total: {len(self.failure_cases)}/{self.max_failure_cases}"
+            )
+        elif acceptance_rate >= 0.5:
+            # High acceptance with no disagreements -> replay buffer
+            self.replay_buffer.append(example)
+            if len(self.replay_buffer) > self.replay_buffer_size:
+                self.replay_buffer.pop(0)
+        else:
+            # Low acceptance but no detailed disagreements
+            self.failure_cases.append(example)
+            logger.info(
+                f"Added failure case (acceptance: {acceptance_rate:.2%}). "
+                f"Total: {len(self.failure_cases)}/{self.max_failure_cases}"
+            )
+        
+        # Save to disk
+        self._save_to_disk()
+        
+        # Check if training should be triggered
+        return len(self.failure_cases) >= self.max_failure_cases
 
 
 class AcceptanceRateTracker:

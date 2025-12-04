@@ -6,17 +6,23 @@ for acceptance rates, failure cases, and training data collection.
 
 Uses MLX-LM's optimized implementation which includes proper KV caching,
 cache rewinding on rejections, and efficient parallel verification.
+
+For detailed data collection (token-level disagreements), use the
+ManualSpeculativeDecoder from speculative_manual.py instead.
 """
 
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict, Any, Callable
+from typing import List, Optional, Tuple, Dict, Any, Callable, TYPE_CHECKING
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm import stream_generate, generate as mlx_generate
 from mlx_lm.sample_utils import make_sampler
+
+if TYPE_CHECKING:
+    from .speculative_manual import ManualSpeculativeDecoder, ManualSpeculativeResult
 
 logger = logging.getLogger(__name__)
 
@@ -324,6 +330,54 @@ class SpeculativeDecoder:
         mx.clear_cache()
 
         return text, elapsed
+    
+    def create_manual_decoder(self) -> "ManualSpeculativeDecoder":
+        """
+        Create a ManualSpeculativeDecoder with the same configuration.
+        
+        The manual decoder implements speculative decoding from scratch to
+        capture detailed token-level disagreements for training. It's slower
+        than the built-in version (~20%) but provides much more training signal.
+        
+        Use this for data collection runs, not production inference.
+        
+        Returns:
+            ManualSpeculativeDecoder configured with same models and settings
+        """
+        from .speculative_manual import ManualSpeculativeDecoder
+        
+        return ManualSpeculativeDecoder(
+            target_model=self.target_model,
+            draft_model=self.draft_model,
+            tokenizer=self.tokenizer,
+            num_draft_tokens=self.num_draft_tokens,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            acceptance_threshold=self.acceptance_threshold,
+            system_message=self.system_message,
+        )
+    
+    def generate_detailed(
+        self,
+        prompt: str,
+        max_tokens: int = 256,
+    ) -> "ManualSpeculativeResult":
+        """
+        Generate text using manual speculative decoding with token-level data.
+        
+        This method uses the ManualSpeculativeDecoder internally to capture
+        detailed disagreement information. It's slower than generate() but
+        provides more valuable training data.
+        
+        Args:
+            prompt: Input prompt text
+            max_tokens: Maximum tokens to generate
+            
+        Returns:
+            ManualSpeculativeResult with token-level disagreement data
+        """
+        manual_decoder = self.create_manual_decoder()
+        return manual_decoder.generate_with_data_collection(prompt, max_tokens)
 
 
 def run_acceptance_benchmark(
