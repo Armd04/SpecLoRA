@@ -181,6 +181,9 @@ class SpeculativeDecodingSystem:
                 max_tokens=max_tokens,
             )
             
+            # Increment generation counter
+            self._generation_count += 1
+            
             # Track acceptance rate
             self.rate_tracker.add_rate(result.metrics.acceptance_rate)
             
