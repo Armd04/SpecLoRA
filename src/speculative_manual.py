@@ -158,7 +158,13 @@ class ManualSpeculativeDecoder:
         # Get EOS token
         self.eos_token_id = tokenizer.eos_token_id
         if self.eos_token_id is None:
-            self.eos_token_id = tokenizer.convert_tokens_to_ids("</s>")
+            # convert_tokens_to_ids may return a list [id] instead of int
+            # Ensure we always have an int for comparisons
+            eos_result = tokenizer.convert_tokens_to_ids("</s>")
+            if isinstance(eos_result, list):
+                self.eos_token_id = eos_result[0] if eos_result else None
+            else:
+                self.eos_token_id = eos_result
         
         # Check for chat template support
         self._has_chat_template = (
@@ -417,8 +423,11 @@ class ManualSpeculativeDecoder:
         metrics.total_time_seconds = time.time() - start_time
         metrics.total_tokens_generated = len(generated_tokens)
         
-        # Decode generated tokens
-        generated_text = self.tokenizer.decode(generated_tokens)
+        # Decode generated tokens (strip EOS token from display)
+        tokens_to_decode = generated_tokens.copy()
+        if tokens_to_decode and tokens_to_decode[-1] == self.eos_token_id:
+            tokens_to_decode = tokens_to_decode[:-1]
+        generated_text = self.tokenizer.decode(tokens_to_decode)
         
         # Determine if this is a failure case
         is_failure = metrics.acceptance_rate < self.acceptance_threshold
