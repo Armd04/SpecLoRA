@@ -16,19 +16,12 @@ positions where the draft model fails, rather than uniformly across sequences.
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict, Any, Callable
+from typing import List, Optional, Tuple, Dict, Any
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .data_collector import TokenLevelDisagreement
-from .models import (
-    create_kv_cache,
-    get_logits_with_cache,
-    rewind_cache,
-    get_cache_length,
-    sample_token,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -132,8 +125,8 @@ class ManualSpeculativeDecoder:
         draft_model: nn.Module,
         tokenizer: Any,
         num_draft_tokens: int = 4,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
+        temperature: float = 0.0,  # Use greedy by default for consistency
+        top_p: float = 1.0,
         acceptance_threshold: float = 0.5,
         context_window: int = 16,
         system_message: Optional[str] = None,
@@ -190,81 +183,44 @@ class ManualSpeculativeDecoder:
                 logger.warning(f"apply_chat_template failed: {e}")
         return prompt
     
-    def _get_softmax_probs(self, logits: mx.array) -> mx.array:
-        """Convert logits to softmax probabilities."""
-        # Handle different shapes
-        if logits.ndim == 3:
-            logits = logits[0]  # Remove batch dim
-        if logits.ndim == 2:
-            # [seq_len, vocab_size] - return as-is
-            return mx.softmax(logits, axis=-1)
-        # [vocab_size]
-        return mx.softmax(logits, axis=-1)
-    
-    def _sample_from_logits(
-        self,
-        logits: mx.array,
-    ) -> Tuple[int, float]:
+    def _sample_token(self, logits: mx.array) -> Tuple[int, float]:
         """
-        Sample a token from logits and return the token and its probability.
+        Sample a token from logits using temperature sampling.
         
         Args:
-            logits: Logits for vocabulary [vocab_size] or [1, vocab_size]
+            logits: Logits of shape [vocab_size]
             
         Returns:
-            Tuple of (sampled_token_id, probability)
+            Tuple of (token_id, probability)
         """
-        if logits.ndim == 2:
-            logits = logits[0]
+        # Ensure 1D
+        if logits.ndim > 1:
+            logits = logits.reshape(-1)
         
         probs = mx.softmax(logits, axis=-1)
         
         if self.temperature == 0:
-            # Greedy sampling
+            # Greedy
             token = mx.argmax(logits).item()
-            prob = probs[token].item()
         else:
             # Temperature sampling
             scaled_logits = logits / self.temperature
-            
-            # Top-p sampling
-            if self.top_p < 1.0:
-                sorted_indices = mx.argsort(-scaled_logits)
-                sorted_probs = mx.softmax(scaled_logits[sorted_indices], axis=-1)
-                cumsum = mx.cumsum(sorted_probs)
-                
-                # Find cutoff
-                mask = cumsum <= self.top_p
-                # Always include at least one token
-                mask = mx.concatenate([mx.array([True]), mask[:-1]])
-                
-                # Zero out tokens beyond cutoff
-                scaled_logits_masked = mx.where(
-                    mx.zeros_like(scaled_logits).at[sorted_indices].add(
-                        mask.astype(scaled_logits.dtype)
-                    ) > 0,
-                    scaled_logits,
-                    mx.full_like(scaled_logits, float('-inf'))
-                )
-                scaled_logits = scaled_logits_masked
-            
-            # Sample
             token = mx.random.categorical(scaled_logits).item()
-            prob = probs[token].item()
         
+        prob = probs[token].item()
         return token, prob
     
-    def _accept_token(
+    def _verify_and_accept(
         self,
         draft_token: int,
         draft_prob: float,
         target_logits: mx.array,
     ) -> Tuple[bool, int, float]:
         """
-        Decide whether to accept a draft token using speculative sampling.
+        Verify a draft token against target model's prediction.
         
-        For greedy (temp=0): Accept if target argmax matches draft
-        For sampling (temp>0): Accept with probability min(1, p_target/p_draft)
+        Uses greedy comparison: accept if target's argmax matches draft.
+        For temperature > 0, uses probabilistic acceptance.
         
         Args:
             draft_token: Token proposed by draft model
@@ -273,45 +229,34 @@ class ManualSpeculativeDecoder:
             
         Returns:
             Tuple of (accepted, final_token, target_prob)
-            - accepted: Whether draft token was accepted
-            - final_token: Token to use (draft if accepted, else resampled)
-            - target_prob: Target's probability for the final token
         """
-        if target_logits.ndim == 2:
-            target_logits = target_logits[0]
+        if target_logits.ndim > 1:
+            target_logits = target_logits.reshape(-1)
         
         target_probs = mx.softmax(target_logits, axis=-1)
-        target_prob_draft = target_probs[draft_token].item()
         
         if self.temperature == 0:
-            # Greedy: accept if target agrees
-            target_token = mx.argmax(target_logits).item()
-            accepted = (target_token == draft_token)
-            if accepted:
-                return True, draft_token, target_prob_draft
-            else:
-                return False, target_token, target_probs[target_token].item()
-        else:
-            # Probabilistic acceptance: r < p_target / p_draft
-            acceptance_prob = min(1.0, target_prob_draft / max(draft_prob, 1e-10))
-            r = mx.random.uniform().item()
+            # Greedy verification
+            target_choice = mx.argmax(target_logits).item()
+            accepted = (target_choice == draft_token)
             
-            if r < acceptance_prob:
-                return True, draft_token, target_prob_draft
+            if accepted:
+                return True, draft_token, target_probs[draft_token].item()
             else:
-                # Rejection: sample from adjusted distribution
-                # p_adjusted = max(0, p_target - p_draft) normalized
-                adjusted_probs = mx.maximum(
-                    target_probs - draft_prob * mx.ones_like(target_probs),
-                    mx.zeros_like(target_probs)
-                )
-                adjusted_probs = adjusted_probs / (mx.sum(adjusted_probs) + 1e-10)
-                
-                # Sample from adjusted distribution
-                final_token = mx.random.categorical(mx.log(adjusted_probs + 1e-10)).item()
-                final_prob = target_probs[final_token].item()
-                
-                return False, final_token, final_prob
+                return False, target_choice, target_probs[target_choice].item()
+        else:
+            # Probabilistic acceptance: accept with prob min(1, p_target/p_draft)
+            target_prob_for_draft = target_probs[draft_token].item()
+            acceptance_ratio = min(1.0, target_prob_for_draft / max(draft_prob, 1e-10))
+            
+            r = mx.random.uniform().item()
+            if r < acceptance_ratio:
+                return True, draft_token, target_prob_for_draft
+            else:
+                # Sample from target distribution
+                scaled_logits = target_logits / self.temperature
+                target_choice = mx.random.categorical(scaled_logits).item()
+                return False, target_choice, target_probs[target_choice].item()
     
     def generate_with_data_collection(
         self,
@@ -321,9 +266,6 @@ class ManualSpeculativeDecoder:
     ) -> ManualSpeculativeResult:
         """
         Generate text using manual speculative decoding with full data collection.
-        
-        This is the main entry point for data collection. It implements speculative
-        decoding from scratch to capture every token-level decision.
         
         Args:
             prompt: Input prompt text
@@ -342,24 +284,10 @@ class ManualSpeculativeDecoder:
         # Format and encode prompt
         formatted_prompt = self._format_prompt(prompt)
         prompt_tokens = self.tokenizer.encode(formatted_prompt)
-        prompt_tensor = mx.array(prompt_tokens)[None, :]  # [1, seq_len]
         
-        # Initialize: run prompt through both models to populate caches
-        draft_cache = create_kv_cache(self.draft_model)
-        target_cache = create_kv_cache(self.target_model)
-        
-        # Process prompt with both models
-        draft_logits, draft_cache = get_logits_with_cache(
-            self.draft_model, prompt_tensor, draft_cache
-        )
-        target_logits, target_cache = get_logits_with_cache(
-            self.target_model, prompt_tensor, target_cache
-        )
-        mx.eval(draft_logits, target_logits)
-        
-        # Track generated tokens
+        # Build the full sequence: start with prompt tokens
+        all_tokens = list(prompt_tokens)
         generated_tokens: List[int] = []
-        current_position = len(prompt_tokens)
         
         # Main generation loop
         while len(generated_tokens) < max_tokens:
@@ -371,29 +299,33 @@ class ManualSpeculativeDecoder:
             draft_tokens: List[int] = []
             draft_probs: List[float] = []
             
-            for _ in range(K):
-                # Get next token prediction from draft
-                if len(draft_tokens) == 0:
-                    # First draft token uses last position's logits
-                    next_logits = draft_logits[:, -1, :]
-                else:
-                    # Subsequent tokens: run draft model on previous draft token
-                    prev_token = mx.array([[draft_tokens[-1]]])
-                    next_logits, draft_cache = get_logits_with_cache(
-                        self.draft_model, prev_token, draft_cache
-                    )
-                    next_logits = next_logits[:, -1, :]
-                
-                mx.eval(next_logits)
-                
-                # Sample token
-                token, prob = self._sample_from_logits(next_logits)
+            # Run draft model on current sequence
+            input_tensor = mx.array(all_tokens)[None, :]
+            draft_output = self.draft_model(input_tensor)
+            mx.eval(draft_output)
+            
+            # Get logits for next token (after the current sequence)
+            current_logits = draft_output[0, -1, :]
+            
+            for k in range(K):
+                # Sample from draft
+                token, prob = self._sample_token(current_logits)
                 draft_tokens.append(token)
                 draft_probs.append(prob)
                 
-                # Stop if EOS
                 if token == self.eos_token_id:
                     break
+                
+                # Get logits for next position
+                if k < K - 1:
+                    next_input = mx.array([[token]])
+                    # Note: For simplicity, we re-run without KV cache
+                    # This is slower but more reliable
+                    temp_sequence = all_tokens + draft_tokens
+                    temp_input = mx.array(temp_sequence)[None, :]
+                    draft_output = self.draft_model(temp_input)
+                    mx.eval(draft_output)
+                    current_logits = draft_output[0, -1, :]
             
             metrics.draft_time_seconds += time.time() - draft_start
             metrics.draft_tokens_proposed += len(draft_tokens)
@@ -402,49 +334,54 @@ class ManualSpeculativeDecoder:
                 break
             
             # ============================================================
-            # VERIFY PHASE: Run target model on all draft tokens at once
+            # VERIFY PHASE: Run target model to verify draft tokens
             # ============================================================
             verify_start = time.time()
             
-            # Create tensor of draft tokens for parallel verification
-            draft_tensor = mx.array([draft_tokens])  # [1, K]
-            
-            # Get target logits for all draft positions in one forward pass
-            verify_logits, target_cache = get_logits_with_cache(
-                self.target_model, draft_tensor, target_cache
-            )
-            mx.eval(verify_logits)
+            # Run target on sequence + all draft tokens
+            verify_sequence = all_tokens + draft_tokens
+            verify_input = mx.array(verify_sequence)[None, :]
+            target_output = self.target_model(verify_input)
+            mx.eval(target_output)
             
             metrics.verify_time_seconds += time.time() - verify_start
             
             # ============================================================
-            # COMPARE & RECORD: Check each position and record disagreements
+            # COMPARE: Check each draft token against target's prediction
             # ============================================================
+            # 
+            # Key insight: target_output[0, i, :] contains logits for predicting
+            # position i+1. So to verify draft_tokens[k], we look at
+            # target_output[0, len(all_tokens) - 1 + k, :]
+            #
+            # Position len(all_tokens) - 1 is the last prompt token,
+            # and its output predicts what should come at len(all_tokens),
+            # which is where draft_tokens[0] is.
+            
             accepted_count = 0
             final_tokens: List[int] = []
             
-            for i, (draft_token, draft_prob) in enumerate(zip(draft_tokens, draft_probs)):
-                # Get target logits for this position
-                target_pos_logits = verify_logits[0, i, :]
+            for k, (draft_token, draft_prob) in enumerate(zip(draft_tokens, draft_probs)):
+                # Target logits that predict position (len(all_tokens) + k)
+                # These are at output position (len(all_tokens) - 1 + k)
+                target_pos = len(all_tokens) - 1 + k
+                target_logits = target_output[0, target_pos, :]
                 
-                # Decide acceptance
-                accepted, final_token, target_prob = self._accept_token(
-                    draft_token, draft_prob, target_pos_logits
+                # Verify
+                accepted, final_token, target_prob = self._verify_and_accept(
+                    draft_token, draft_prob, target_logits
                 )
                 
                 if accepted:
                     accepted_count += 1
                     final_tokens.append(final_token)
                 else:
-                    # Record disagreement with context
-                    context_start = max(0, len(prompt_tokens) + len(generated_tokens) - self.context_window)
-                    context_end = len(prompt_tokens) + len(generated_tokens)
-                    
-                    all_tokens = prompt_tokens + generated_tokens
-                    context = all_tokens[context_start:context_end]
+                    # Record disagreement
+                    context_start = max(0, len(all_tokens) - self.context_window)
+                    context = all_tokens[context_start:]
                     
                     disagreement = TokenLevelDisagreement(
-                        position=current_position + i,
+                        position=len(all_tokens) + k,
                         draft_token=draft_token,
                         target_token=final_token,
                         draft_confidence=draft_prob,
@@ -454,43 +391,21 @@ class ManualSpeculativeDecoder:
                     disagreements.append(disagreement)
                     metrics.num_disagreements += 1
                     
-                    # Add the corrected token and stop
+                    # Add the corrected token and stop accepting more
                     final_tokens.append(final_token)
                     break
                 
-                # Stop at EOS
                 if final_token == self.eos_token_id:
                     break
             
             metrics.draft_tokens_accepted += accepted_count
             
             # ============================================================
-            # UPDATE: Add accepted tokens and rewind caches if needed
+            # UPDATE: Add accepted/corrected tokens to sequence
             # ============================================================
             if final_tokens:
+                all_tokens.extend(final_tokens)
                 generated_tokens.extend(final_tokens)
-                current_position += len(final_tokens)
-                
-                # If we rejected some tokens, we need to rewind both caches
-                if len(final_tokens) < len(draft_tokens):
-                    # Rewind draft cache to rejection point
-                    # The draft cache advanced by K tokens, but we only kept len(final_tokens)
-                    num_to_rewind = len(draft_tokens) - len(final_tokens)
-                    rewind_to = get_cache_length(draft_cache) - num_to_rewind
-                    draft_cache = rewind_cache(draft_cache, rewind_to)
-                    
-                    # Target cache also needs adjustment
-                    # It verified K tokens but we only kept len(final_tokens)
-                    rewind_to = get_cache_length(target_cache) - num_to_rewind
-                    target_cache = rewind_cache(target_cache, rewind_to)
-                    
-                    # Re-process the last accepted token to set up for next iteration
-                    if final_tokens:
-                        last_token = mx.array([[final_tokens[-1]]])
-                        draft_logits, draft_cache = get_logits_with_cache(
-                            self.draft_model, last_token, draft_cache
-                        )
-                        mx.eval(draft_logits)
             
             # Check for EOS
             if generated_tokens and generated_tokens[-1] == self.eos_token_id:
@@ -533,13 +448,6 @@ class ManualSpeculativeDecoder:
     ) -> ManualSpeculativeResult:
         """
         Convenience method that calls generate_with_data_collection.
-        
-        Args:
-            prompt: Input prompt text
-            max_tokens: Maximum tokens to generate
-            
-        Returns:
-            ManualSpeculativeResult with generated text and disagreement data
         """
         return self.generate_with_data_collection(prompt, max_tokens)
 
@@ -552,9 +460,6 @@ def run_data_collection_batch(
 ) -> Tuple[List[ManualSpeculativeResult], Dict[str, Any]]:
     """
     Run manual speculative decoding on a batch of prompts for data collection.
-    
-    This function processes multiple prompts and aggregates the results,
-    providing detailed statistics about the collected data.
     
     Args:
         decoder: Configured ManualSpeculativeDecoder
