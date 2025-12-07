@@ -704,8 +704,9 @@ def interactive(ctx):
 @cli.command()
 @click.option("--prompt", "-p", required=True, help="Test prompt")
 @click.option("--iterations", "-n", default=5, help="Number of iterations")
+@click.option("--max-tokens", "-m", default=128, help="Maximum tokens to generate")
 @click.pass_context
-def benchmark(ctx, prompt, iterations):
+def benchmark(ctx, prompt, iterations, max_tokens):
     """Benchmark speculative vs standard decoding."""
     system = SpeculativeDecodingSystem(ctx.obj["config"])
     system.initialize()
@@ -723,7 +724,7 @@ def benchmark(ctx, prompt, iterations):
     
     for _ in range(iterations):
         start = time.time()
-        result = system.decoder.generate(prompt, max_tokens=128, collect_training_data=False)
+        result = system.decoder.generate(prompt, max_tokens=max_tokens, collect_training_data=False)
         elapsed = time.time() - start
         spec_times.append(elapsed)
         spec_tokens.append(result.metrics.total_tokens_generated)
@@ -735,7 +736,7 @@ def benchmark(ctx, prompt, iterations):
     
     for _ in range(iterations):
         start = time.time()
-        text, elapsed = system.decoder.generate_standard(prompt, max_tokens=128, use_target=True)
+        text, elapsed = system.decoder.generate_standard(prompt, max_tokens=max_tokens, use_target=True)
         std_times.append(elapsed)
         std_tokens.append(len(system.decoder.tokenizer.encode(text)))
     

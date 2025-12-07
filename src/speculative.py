@@ -315,12 +315,15 @@ class SpeculativeDecoder:
         """
         model = self.target_model if use_target else self.draft_model
 
+        # Format prompt using the appropriate chat template
+        formatted_prompt = self._format_prompt(prompt)
+
         start_time = time.time()
 
         text = mlx_generate(
             model=model,
             tokenizer=self.tokenizer,
-            prompt=prompt,
+            prompt=formatted_prompt,
             max_tokens=max_tokens,
             verbose=False,
         )
