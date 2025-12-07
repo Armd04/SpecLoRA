@@ -453,12 +453,25 @@ class DataCollector:
         Returns:
             True if training should be triggered
         """
+        # Reconstruct draft output from disagreements
+        # Start with final output (target tokens), then replace disagreement positions
+        # with what the draft model actually predicted
+        draft_output = generated_tokens.copy()
+        for disagreement in disagreements:
+            if disagreement.position >= len(draft_output):
+                logger.warning(
+                    f"Disagreement position {disagreement.position} out of bounds "
+                    f"for sequence length {len(generated_tokens)}. Skipping."
+                )
+                continue
+            draft_output[disagreement.position] = disagreement.draft_token
+
         # Create training example with detailed data
         example = TrainingExample(
             id=self._generate_id(),
             prompt=prompt,
-            draft_output=generated_tokens,  # Draft attempted these
-            target_output=generated_tokens,  # Final output (after corrections)
+            draft_output=draft_output,  # Draft's original predictions
+            target_output=generated_tokens,  # Final output (target's choices)
             acceptance_rate=acceptance_rate,
             timestamp=datetime.now().isoformat(),
             is_failure=acceptance_rate < 0.5,  # Consider low acceptance as failure

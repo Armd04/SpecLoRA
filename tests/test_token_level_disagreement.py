@@ -254,7 +254,7 @@ class TestDataCollectorWithDetailedData:
                 failures_dir=tmpdir,
                 max_failure_cases=100,
             )
-            
+
             disagreements = [
                 TokenLevelDisagreement(
                     position=5,
@@ -264,28 +264,35 @@ class TestDataCollectorWithDetailedData:
                     target_confidence=0.8,
                 ),
             ]
-            
+
             # Add detailed result
+            # generated_tokens contains the final output (target's choices)
+            # At position 5, target chose 200 (disagreement.target_token)
             should_train = collector.add_detailed_result(
                 prompt="Test prompt",
-                generated_tokens=[1, 2, 3, 4, 5],
+                generated_tokens=[1, 2, 3, 4, 5, 200],
                 disagreements=disagreements,
                 acceptance_rate=0.6,
             )
-            
+
             assert should_train is False  # Not enough cases yet
             assert len(collector.failure_cases) == 1
-            
+
             # Check the stored example
             example = collector.failure_cases[0]
             assert example.has_detailed_data is True
             assert len(example.disagreements) == 1
+
+            # Verify draft_output reconstruction
+            # Draft wanted 100 at position 5, target chose 200
+            assert example.draft_output == [1, 2, 3, 4, 5, 100]
+            assert example.target_output == [1, 2, 3, 4, 5, 200]
     
     def test_export_includes_disagreements(self):
         """Test that export includes disagreement data."""
         with tempfile.TemporaryDirectory() as tmpdir:
             collector = DataCollector(failures_dir=tmpdir)
-            
+
             disagreements = [
                 TokenLevelDisagreement(
                     position=3,
@@ -296,27 +303,32 @@ class TestDataCollectorWithDetailedData:
                     context_tokens=[1, 2],
                 ),
             ]
-            
+
+            # generated_tokens contains final output with target's choice at position 3
             collector.add_detailed_result(
                 prompt="Export test",
-                generated_tokens=[1, 2, 3],
+                generated_tokens=[1, 2, 3, 60],
                 disagreements=disagreements,
                 acceptance_rate=0.5,
             )
-            
+
             # Export
             output_path = Path(tmpdir) / "export.jsonl"
             collector.export_for_training(str(output_path))
-            
+
             # Read and verify
             with open(output_path) as f:
                 line = f.readline()
                 data = json.loads(line)
-            
+
             assert "disagreements" in data
             assert "disagreement_positions" in data
             assert data["disagreement_positions"] == [3]
             assert "high_confidence_failure_positions" in data
+
+            # Verify draft and target outputs are different
+            assert data["draft_tokens"] == [1, 2, 3, 50]  # Draft wanted 50 at pos 3
+            assert data["target_tokens"] == [1, 2, 3, 60]  # Target chose 60 at pos 3
 
 
 if __name__ == "__main__":
