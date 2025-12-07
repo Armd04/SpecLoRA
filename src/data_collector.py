@@ -497,7 +497,8 @@ class DataCollector:
 
         # Create training example with detailed data
         # Store prompt_length in metadata for later use in export
-        metadata_with_prompt_length = metadata or {}
+        # Create a copy to avoid mutating the caller's dictionary
+        metadata_with_prompt_length = dict(metadata) if metadata else {}
         if prompt_length is not None:
             metadata_with_prompt_length["prompt_length"] = prompt_length
 
