@@ -383,9 +383,11 @@ class ManualSpeculativeDecoder:
                     final_tokens.append(final_token)
                 else:
                     # Record disagreement
-                    context_start = max(0, len(all_tokens) - self.context_window)
-                    context = all_tokens[context_start:]
-                    
+                    # Include both all_tokens AND the k tokens already accepted in this iteration
+                    full_sequence_before_disagreement = all_tokens + final_tokens
+                    context_start = max(0, len(full_sequence_before_disagreement) - self.context_window)
+                    context = full_sequence_before_disagreement[context_start:]
+
                     disagreement = TokenLevelDisagreement(
                         position=len(all_tokens) + k,
                         draft_token=draft_token,

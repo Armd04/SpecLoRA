@@ -189,6 +189,38 @@ class SpeculativeDecodingSystem:
             
             # Collect detailed data if enabled
             if collect_data:
+                # Calculate prompt length for accurate disagreement position mapping
+                # Need to format and tokenize the prompt the same way the decoder does
+                # IMPORTANT: Use the decoder's actual system_message to ensure consistency
+                formatted_prompt = result.prompt  # Use the original prompt
+                if hasattr(self.decoder, 'tokenizer'):
+                    try:
+                        # Format the prompt if chat template is available
+                        # Use self.decoder.system_message to match what was actually used during generation
+                        if hasattr(self.decoder.tokenizer, 'apply_chat_template'):
+                            system_message = self.decoder.system_message
+                            messages = [
+                                {"role": "system", "content": system_message},
+                                {"role": "user", "content": prompt},
+                            ]
+                            try:
+                                formatted_prompt = self.decoder.tokenizer.apply_chat_template(
+                                    messages,
+                                    tokenize=False,
+                                    add_generation_prompt=True,
+                                )
+                            except Exception:
+                                formatted_prompt = prompt
+
+                        # Tokenize to get the prompt length
+                        prompt_tokens = self.decoder.tokenizer.encode(formatted_prompt)
+                        prompt_length = len(prompt_tokens)
+                    except Exception as e:
+                        logger.warning(f"Could not calculate prompt length: {e}")
+                        prompt_length = None
+                else:
+                    prompt_length = None
+
                 should_train = self.data_collector.add_detailed_result(
                     prompt=prompt,
                     generated_tokens=result.tokens,
@@ -199,7 +231,8 @@ class SpeculativeDecodingSystem:
                         "tokens_per_second": result.metrics.tokens_per_second,
                         "draft_time": result.metrics.draft_time_seconds,
                         "verify_time": result.metrics.verify_time_seconds,
-                    }
+                    },
+                    prompt_length=prompt_length,
                 )
                 
                 if should_train:
@@ -319,13 +352,24 @@ class SpeculativeDecodingSystem:
                     prompt, max_tokens
                 )
                 results.append(result)
-                
+
+                # Calculate prompt length for accurate disagreement position mapping
+                prompt_length = None
+                if hasattr(manual_decoder, 'tokenizer'):
+                    try:
+                        formatted_prompt = manual_decoder._format_prompt(prompt)
+                        prompt_tokens = manual_decoder.tokenizer.encode(formatted_prompt)
+                        prompt_length = len(prompt_tokens)
+                    except Exception as e:
+                        logger.warning(f"Could not calculate prompt length: {e}")
+
                 # Add to collector
                 self.data_collector.add_detailed_result(
                     prompt=prompt,
                     generated_tokens=result.tokens,
                     disagreements=result.disagreements,
                     acceptance_rate=result.metrics.acceptance_rate,
+                    prompt_length=prompt_length,
                 )
                 
                 # Track aggregate stats

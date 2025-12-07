@@ -402,10 +402,24 @@ class DataCollector:
             
             # Include token-level disagreement data if available
             if ex.has_detailed_data:
-                item["disagreements"] = [d.to_dict() for d in ex.disagreements]
-                item["disagreement_positions"] = [d.position for d in ex.disagreements]
+                # Get prompt_length from metadata if available
+                prompt_length = ex.metadata.get("prompt_length", 0) if ex.metadata else 0
+
+                # Export disagreements with relative positions (positions in generated sequence)
+                # Convert absolute positions to relative for training purposes
+                disagreements_export = []
+                for d in ex.disagreements:
+                    d_dict = d.to_dict()
+                    # Store both absolute and relative positions for flexibility
+                    d_dict["absolute_position"] = d.position
+                    d_dict["relative_position"] = d.position - prompt_length
+                    disagreements_export.append(d_dict)
+
+                item["disagreements"] = disagreements_export
+                # Use relative positions for training (positions in generated sequence)
+                item["disagreement_positions"] = [d.position - prompt_length for d in ex.disagreements]
                 item["high_confidence_failure_positions"] = [
-                    d.position for d in ex.high_confidence_failures
+                    d.position - prompt_length for d in ex.high_confidence_failures
                 ]
             
             formatted_data.append(item)
@@ -436,20 +450,22 @@ class DataCollector:
         disagreements: List[TokenLevelDisagreement],
         acceptance_rate: float,
         metadata: Optional[Dict[str, Any]] = None,
+        prompt_length: Optional[int] = None,
     ) -> bool:
         """
         Add a result from manual speculative decoding with token-level details.
-        
+
         This method is specifically for results from ManualSpeculativeDecoder
         which provides detailed disagreement information.
-        
+
         Args:
             prompt: The input prompt
-            generated_tokens: All tokens generated (final output)
-            disagreements: List of token-level disagreements
+            generated_tokens: All tokens generated (final output, without prompt)
+            disagreements: List of token-level disagreements (positions are absolute, including prompt)
             acceptance_rate: Overall acceptance rate
             metadata: Optional additional metadata
-            
+            prompt_length: Length of the tokenized prompt (required if disagreements exist)
+
         Returns:
             True if training should be triggered
         """
@@ -457,16 +473,34 @@ class DataCollector:
         # Start with final output (target tokens), then replace disagreement positions
         # with what the draft model actually predicted
         draft_output = generated_tokens.copy()
+
+        # Convert absolute positions to relative positions (subtract prompt length)
+        # Disagreement positions include prompt tokens, but generated_tokens doesn't
+        if disagreements and prompt_length is None:
+            logger.warning(
+                "prompt_length is required when disagreements exist. "
+                "Cannot reconstruct draft output accurately."
+            )
+
         for disagreement in disagreements:
-            if disagreement.position >= len(draft_output):
+            # Convert absolute position to relative position in generated sequence
+            relative_position = disagreement.position - (prompt_length or 0)
+
+            if relative_position < 0 or relative_position >= len(draft_output):
                 logger.warning(
-                    f"Disagreement position {disagreement.position} out of bounds "
-                    f"for sequence length {len(generated_tokens)}. Skipping."
+                    f"Disagreement at absolute position {disagreement.position} "
+                    f"(relative: {relative_position}) out of bounds "
+                    f"for generated sequence length {len(generated_tokens)}. Skipping."
                 )
                 continue
-            draft_output[disagreement.position] = disagreement.draft_token
+            draft_output[relative_position] = disagreement.draft_token
 
         # Create training example with detailed data
+        # Store prompt_length in metadata for later use in export
+        metadata_with_prompt_length = metadata or {}
+        if prompt_length is not None:
+            metadata_with_prompt_length["prompt_length"] = prompt_length
+
         example = TrainingExample(
             id=self._generate_id(),
             prompt=prompt,
@@ -475,7 +509,7 @@ class DataCollector:
             acceptance_rate=acceptance_rate,
             timestamp=datetime.now().isoformat(),
             is_failure=acceptance_rate < 0.5,  # Consider low acceptance as failure
-            metadata=metadata or {},
+            metadata=metadata_with_prompt_length,
             disagreements=disagreements,
         )
         

@@ -255,9 +255,12 @@ class TestDataCollectorWithDetailedData:
                 max_failure_cases=100,
             )
 
+            # Simulate: prompt is 10 tokens, generated 6 tokens
+            # Disagreement at absolute position 15 (= prompt_length 10 + relative position 5)
+            prompt_length = 10
             disagreements = [
                 TokenLevelDisagreement(
-                    position=5,
+                    position=15,  # Absolute position including prompt
                     draft_token=100,
                     target_token=200,
                     draft_confidence=0.5,
@@ -266,13 +269,14 @@ class TestDataCollectorWithDetailedData:
             ]
 
             # Add detailed result
-            # generated_tokens contains the final output (target's choices)
-            # At position 5, target chose 200 (disagreement.target_token)
+            # generated_tokens contains the final output (target's choices, WITHOUT prompt)
+            # At absolute position 15 (relative position 5), target chose 200
             should_train = collector.add_detailed_result(
                 prompt="Test prompt",
-                generated_tokens=[1, 2, 3, 4, 5, 200],
+                generated_tokens=[1, 2, 3, 4, 5, 200],  # 6 generated tokens
                 disagreements=disagreements,
                 acceptance_rate=0.6,
+                prompt_length=prompt_length,
             )
 
             assert should_train is False  # Not enough cases yet
@@ -284,7 +288,7 @@ class TestDataCollectorWithDetailedData:
             assert len(example.disagreements) == 1
 
             # Verify draft_output reconstruction
-            # Draft wanted 100 at position 5, target chose 200
+            # Draft wanted 100 at relative position 5, target chose 200
             assert example.draft_output == [1, 2, 3, 4, 5, 100]
             assert example.target_output == [1, 2, 3, 4, 5, 200]
     
@@ -293,9 +297,12 @@ class TestDataCollectorWithDetailedData:
         with tempfile.TemporaryDirectory() as tmpdir:
             collector = DataCollector(failures_dir=tmpdir)
 
+            # Simulate: prompt is 5 tokens, generated 4 tokens
+            # Disagreement at absolute position 8 (= prompt_length 5 + relative position 3)
+            prompt_length = 5
             disagreements = [
                 TokenLevelDisagreement(
-                    position=3,
+                    position=8,  # Absolute position including prompt
                     draft_token=50,
                     target_token=60,
                     draft_confidence=0.7,
@@ -304,12 +311,13 @@ class TestDataCollectorWithDetailedData:
                 ),
             ]
 
-            # generated_tokens contains final output with target's choice at position 3
+            # generated_tokens contains final output with target's choice at relative position 3
             collector.add_detailed_result(
                 prompt="Export test",
                 generated_tokens=[1, 2, 3, 60],
                 disagreements=disagreements,
                 acceptance_rate=0.5,
+                prompt_length=prompt_length,
             )
 
             # Export
