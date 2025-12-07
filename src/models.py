@@ -410,19 +410,10 @@ def _rewind_layer_cache(layer_cache: Any, position: int) -> Any:
                 # Unknown format, return as-is
                 return layer_cache
             return (truncated_keys, truncated_values)
-    
-    # Handle object with keys/values attributes
-    if hasattr(layer_cache, 'keys') and hasattr(layer_cache, 'values'):
-        if layer_cache.keys is not None:
-            if layer_cache.keys.ndim == 4:
-                layer_cache.keys = layer_cache.keys[:, :, :position, :]
-                layer_cache.values = layer_cache.values[:, :, :position, :]
-            elif layer_cache.keys.ndim == 3:
-                layer_cache.keys = layer_cache.keys[:, :position, :]
-                layer_cache.values = layer_cache.values[:, :position, :]
-        return layer_cache
-    
+
     # Handle MLX-LM's KVCache object which has update/rewind methods
+    # IMPORTANT: Check this BEFORE checking for keys/values alone, since MLX-LM's
+    # KVCache objects have all three attributes (keys, values, AND offset)
     if hasattr(layer_cache, 'offset'):
         # MLX-LM uses offset tracking, adjust it
         layer_cache.offset = position
@@ -433,7 +424,18 @@ def _rewind_layer_cache(layer_cache: Any, position: int) -> Any:
             elif layer_cache.keys.ndim == 3:
                 layer_cache.keys = layer_cache.keys[:, :position, :]
                 layer_cache.values = layer_cache.values[:, :position, :]
-    
+        return layer_cache
+
+    # Handle object with keys/values attributes (but no offset)
+    if hasattr(layer_cache, 'keys') and hasattr(layer_cache, 'values'):
+        if layer_cache.keys is not None:
+            if layer_cache.keys.ndim == 4:
+                layer_cache.keys = layer_cache.keys[:, :, :position, :]
+                layer_cache.values = layer_cache.values[:, :, :position, :]
+            elif layer_cache.keys.ndim == 3:
+                layer_cache.keys = layer_cache.keys[:, :position, :]
+                layer_cache.values = layer_cache.values[:, :position, :]
+
     return layer_cache
 
 
