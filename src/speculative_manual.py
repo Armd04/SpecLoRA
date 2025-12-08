@@ -7,7 +7,7 @@ draft and target models.
 
 The key difference from the built-in version:
 - Built-in: Fast, optimized, but only exposes overall acceptance rates
-- Manual: Slightly slower (~20%), but captures every token decision for training
+- Manual: Comparable speed (with KV caching), captures every token decision for training
 
 This enables more effective LoRA training by focusing gradients on specific
 positions where the draft model fails, rather than uniformly across sequences.
@@ -22,6 +22,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .data_collector import TokenLevelDisagreement
+from .models import create_kv_cache, get_logits_with_cache, rewind_cache, get_cache_length
 
 logger = logging.getLogger(__name__)
 
@@ -108,15 +109,15 @@ class ManualSpeculativeDecoder:
     capture every token-level decision between the draft and target models.
     
     Algorithm overview:
-    1. Draft model generates K tokens autoregressively
+    1. Draft model generates K tokens autoregressively (using KV cache)
     2. Target model verifies all K tokens in ONE forward pass
     3. For each position, compare target's choice vs draft's prediction
     4. Record disagreements with full context (tokens, confidences)
     5. Accept tokens until first rejection, resample at rejection point
-    6. Rewind caches and continue
-    
-    This is ~20% slower than MLX-LM's built-in speculative decoding but
-    provides much more valuable training signal.
+    6. Update caches with accepted tokens and continue
+
+    With KV caching, performance should be comparable to MLX-LM's built-in
+    speculative decoding while providing much more valuable training signal.
     """
     
     def __init__(
@@ -290,48 +291,66 @@ class ManualSpeculativeDecoder:
         # Format and encode prompt
         formatted_prompt = self._format_prompt(prompt)
         prompt_tokens = self.tokenizer.encode(formatted_prompt)
-        
+
         # Build the full sequence: start with prompt tokens
         all_tokens = list(prompt_tokens)
         generated_tokens: List[int] = []
+
+        # ============================================================
+        # Initialize KV cache for draft model
+        # ============================================================
+        draft_cache = create_kv_cache(self.draft_model)
+
+        # Populate cache with the prompt and get initial logits
+        prompt_input = mx.array(all_tokens)[None, :]
+        draft_logits, draft_cache = get_logits_with_cache(self.draft_model, prompt_input, draft_cache)
+        mx.eval(draft_cache)
+        mx.eval(draft_logits)
+
+        # Save logits for next position (will be used for first draft token)
+        next_position_logits = draft_logits[0, -1, :]
         
         # Main generation loop
         while len(generated_tokens) < max_tokens:
             draft_start = time.time()
             
             # ============================================================
-            # DRAFT PHASE: Generate K tokens from draft model
+            # DRAFT PHASE: Generate K tokens from draft model (WITH KV CACHE)
             # ============================================================
             draft_tokens: List[int] = []
             draft_probs: List[float] = []
-            
-            # Run draft model on current sequence
-            input_tensor = mx.array(all_tokens)[None, :]
-            draft_output = self.draft_model(input_tensor)
-            mx.eval(draft_output)
-            
-            # Get logits for next token (after the current sequence)
-            current_logits = draft_output[0, -1, :]
-            
+
+            # Save current cache position - we'll rewind after draft generation
+            # since draft tokens are speculative
+            cache_position_before_draft = get_cache_length(draft_cache)
+
+            # Use the saved logits for first draft token
+            current_logits = next_position_logits
+
+            # Generate K draft tokens autoregressively using cache
             for k in range(K):
-                # Sample from draft
+                # Sample from draft model's prediction
                 token, prob = self._sample_token(current_logits)
                 draft_tokens.append(token)
                 draft_probs.append(prob)
-                
+
                 if token == self.eos_token_id:
                     break
-                
-                # Get logits for next position
+
+                # Get logits for next position by passing this token with cache
                 if k < K - 1:
                     next_input = mx.array([[token]])
-                    # Note: For simplicity, we re-run without KV cache
-                    # This is slower but more reliable
-                    temp_sequence = all_tokens + draft_tokens
-                    temp_input = mx.array(temp_sequence)[None, :]
-                    draft_output = self.draft_model(temp_input)
+                    draft_output, draft_cache = get_logits_with_cache(
+                        self.draft_model, next_input, draft_cache
+                    )
                     mx.eval(draft_output)
+                    mx.eval(draft_cache)
                     current_logits = draft_output[0, -1, :]
+
+            # Rewind draft cache to remove speculative draft tokens
+            # They will be added back only if accepted after verification
+            draft_cache = rewind_cache(draft_cache, cache_position_before_draft)
+            mx.eval(draft_cache)
             
             metrics.draft_time_seconds += time.time() - draft_start
             metrics.draft_tokens_proposed += len(draft_tokens)
@@ -409,12 +428,23 @@ class ManualSpeculativeDecoder:
             metrics.draft_tokens_accepted += accepted_count
             
             # ============================================================
-            # UPDATE: Add accepted/corrected tokens to sequence
+            # UPDATE: Add accepted/corrected tokens to sequence and update cache
             # ============================================================
             if final_tokens:
                 all_tokens.extend(final_tokens)
                 generated_tokens.extend(final_tokens)
-            
+
+                # Update draft cache with accepted tokens and get logits for next iteration
+                accepted_input = mx.array(final_tokens)[None, :]
+                draft_output, draft_cache = get_logits_with_cache(
+                    self.draft_model, accepted_input, draft_cache
+                )
+                mx.eval(draft_cache)
+                mx.eval(draft_output)
+
+                # Save logits for next draft token
+                next_position_logits = draft_output[0, -1, :]
+
             # Check for EOS
             if generated_tokens and generated_tokens[-1] == self.eos_token_id:
                 break
