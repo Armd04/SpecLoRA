@@ -132,6 +132,10 @@ speculative:
   temperature: 0.7             # Sampling temperature
   acceptance_threshold: 0.5    # Below = failure case
 
+# Chat formatting (tokenizer template only)
+chat:
+  system_message: "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+
 # LoRA Training
 training:
   lora:
@@ -140,6 +144,8 @@ training:
   learning_rate: 1.0e-4
   min_failure_cases: 50        # When to trigger training
 ```
+
+> **Note:** The system now always formats prompts using the tokenizer's native `apply_chat_template()` implementation. Ensure the target/draft tokenizer pair provides this method; only the `system_message` above is configurable.
 
 ## Architecture
 

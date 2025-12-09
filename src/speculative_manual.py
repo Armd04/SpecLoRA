@@ -155,6 +155,12 @@ class ManualSpeculativeDecoder:
         self.acceptance_threshold = acceptance_threshold
         self.context_window = context_window
         self.system_message = system_message or "You are a helpful assistant."
+
+        if not hasattr(self.tokenizer, 'apply_chat_template') or not callable(self.tokenizer.apply_chat_template):
+            raise ValueError(
+                "ManualSpeculativeDecoder requires a tokenizer with apply_chat_template(). "
+                "Please ensure your tokenizer supports chat templates."
+            )
         
         # Get EOS token
         self.eos_token_id = tokenizer.eos_token_id
@@ -167,28 +173,26 @@ class ManualSpeculativeDecoder:
             else:
                 self.eos_token_id = eos_result
         
-        # Check for chat template support
-        self._has_chat_template = (
-            hasattr(tokenizer, 'apply_chat_template') and 
-            callable(tokenizer.apply_chat_template)
-        )
-    
+    def format_prompt(self, prompt: str) -> str:
+        """Public helper for generating formatted prompts."""
+        return self._format_prompt(prompt)
+
     def _format_prompt(self, prompt: str) -> str:
-        """Format prompt using chat template if available."""
-        if self._has_chat_template:
-            messages = [
-                {"role": "system", "content": self.system_message},
-                {"role": "user", "content": prompt},
-            ]
-            try:
-                return self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-            except Exception as e:
-                logger.warning(f"apply_chat_template failed: {e}")
-        return prompt
+        """Format prompt using tokenizer chat template."""
+        messages = [
+            {"role": "system", "content": self.system_message},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "tokenizer.apply_chat_template() failed during manual decoding."
+            ) from exc
     
     def _sample_token(self, logits: mx.array) -> Tuple[int, float]:
         """

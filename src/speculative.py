@@ -131,9 +131,7 @@ class SpeculativeDecoder:
         temperature: float = 0.7,
         top_p: float = 0.9,
         acceptance_threshold: float = 0.5,
-        chat_template: Optional[str] = None,
         system_message: Optional[str] = None,
-        use_tokenizer_chat_template: bool = True,
     ):
         """
         Initialize the speculative decoder.
@@ -157,14 +155,13 @@ class SpeculativeDecoder:
         self.temperature = temperature
         self.top_p = top_p
         self.acceptance_threshold = acceptance_threshold
-        self.chat_template = chat_template
         self.system_message = system_message or "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
-        self.use_tokenizer_chat_template = use_tokenizer_chat_template
 
-        # Check if tokenizer supports apply_chat_template
-        self._has_chat_template = hasattr(tokenizer, 'apply_chat_template') and callable(tokenizer.apply_chat_template)
-        if self.use_tokenizer_chat_template and not self._has_chat_template:
-            logger.warning("Tokenizer doesn't support apply_chat_template, falling back to manual template")
+        if not hasattr(tokenizer, 'apply_chat_template') or not callable(tokenizer.apply_chat_template):
+            raise ValueError(
+                "SpeculativeDecoder requires a tokenizer with apply_chat_template(). "
+                "Please select a chat model/tokenizer pair that provides it."
+            )
 
         # Get EOS token
         self.eos_token_id = tokenizer.eos_token_id
@@ -180,6 +177,10 @@ class SpeculativeDecoder:
         """
         return make_sampler(temp=self.temperature, top_p=self.top_p)
 
+    def format_prompt(self, prompt: str) -> str:
+        """Expose formatted prompt for external utilities."""
+        return self._format_prompt(prompt)
+
     def _format_prompt(self, prompt: str) -> str:
         """
         Format the prompt using the appropriate chat template.
@@ -193,31 +194,20 @@ class SpeculativeDecoder:
         Returns:
             Formatted prompt string ready for tokenization
         """
-        # Try to use tokenizer's built-in chat template (recommended)
-        if self.use_tokenizer_chat_template and self._has_chat_template:
-            messages = [
-                {"role": "system", "content": self.system_message},
-                {"role": "user", "content": prompt},
-            ]
-            try:
-                formatted = self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                return formatted
-            except Exception as e:
-                logger.warning(f"apply_chat_template failed: {e}, falling back to manual template")
-
-        # Fallback to manual template
-        if self.chat_template:
-            return self.chat_template.format(
-                system=self.system_message,
-                prompt=prompt
+        messages = [
+            {"role": "system", "content": self.system_message},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
             )
-
-        # Last resort: raw prompt
-        return prompt
+        except Exception as exc:
+            raise RuntimeError(
+                "tokenizer.apply_chat_template() failed. Ensure you are using a chat-capable tokenizer."
+            ) from exc
 
     def generate(
         self,
