@@ -309,7 +309,8 @@ class ManualSpeculativeDecoder:
 
         # Save logits for next position (will be used for first draft token)
         next_position_logits = draft_logits[0, -1, :]
-        
+        mx.eval(next_position_logits)  # Evaluate to avoid lazy recomputation
+
         # Main generation loop
         while len(generated_tokens) < max_tokens:
             draft_start = time.time()
@@ -444,6 +445,7 @@ class ManualSpeculativeDecoder:
 
                 # Save logits for next draft token
                 next_position_logits = draft_output[0, -1, :]
+                mx.eval(next_position_logits)  # Evaluate to avoid lazy recomputation
 
             # Check for EOS
             if generated_tokens and generated_tokens[-1] == self.eos_token_id:
