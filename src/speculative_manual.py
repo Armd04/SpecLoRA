@@ -339,6 +339,10 @@ class ManualSpeculativeDecoder:
                     break
 
                 # Get logits for next position by passing this token with cache
+                # NOTE: Only for k < K-1 (not the last token). The last draft token
+                # doesn't need to be added to cache since we won't need logits after it,
+                # and we're about to rewind the cache anyway. This is an intentional
+                # optimization to avoid unnecessary computation.
                 if k < K - 1:
                     next_input = mx.array([[token]])
                     draft_output, draft_cache = get_logits_with_cache(
@@ -349,7 +353,17 @@ class ManualSpeculativeDecoder:
                     current_logits = draft_output[0, -1, :]
 
             # Rewind draft cache to remove speculative draft tokens
-            # They will be added back only if accepted after verification
+            # Cache should have grown by len(draft_tokens)-1 tokens (last token not added)
+            # After rewind, cache returns to state before draft generation
+            if logger.isEnabledFor(logging.DEBUG):
+                cache_len = get_cache_length(draft_cache)
+                expected_len = cache_position_before_draft + len(draft_tokens) - 1
+                if cache_len != expected_len:
+                    logger.debug(
+                        f"Cache length mismatch before rewind: {cache_len} != {expected_len}. "
+                        f"Draft tokens: {len(draft_tokens)}, base position: {cache_position_before_draft}"
+                    )
+
             draft_cache = rewind_cache(draft_cache, cache_position_before_draft)
             mx.eval(draft_cache)
             
