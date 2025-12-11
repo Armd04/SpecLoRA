@@ -15,6 +15,10 @@ class MockTokenizerReturningList:
     def __init__(self):
         self.eos_token_id = None  # Simulate tokenizer without eos_token_id
         self.eos_token = "</s>"
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+        # Minimal chat template support required by ManualSpeculativeDecoder
+        return "".join(m["content"] for m in messages)
     
     def convert_tokens_to_ids(self, token):
         """Return a list [2] instead of int 2."""
@@ -29,6 +33,9 @@ class MockTokenizerReturningInt:
     def __init__(self):
         self.eos_token_id = None
         self.eos_token = "</s>"
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+        return "".join(m["content"] for m in messages)
     
     def convert_tokens_to_ids(self, token):
         """Return int 2 directly."""
@@ -43,6 +50,9 @@ class MockTokenizerWithEosTokenId:
     def __init__(self):
         self.eos_token_id = 2
         self.eos_token = "</s>"
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+        return "".join(m["content"] for m in messages)
     
     def convert_tokens_to_ids(self, token):
         """This shouldn't be called if eos_token_id is already set."""
@@ -149,6 +159,9 @@ def test_empty_list_fallback():
         def __init__(self):
             self.eos_token_id = None
             self.eos_token = "</s>"
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+            return "".join(m["content"] for m in messages)
         
         def convert_tokens_to_ids(self, token):
             return []  # Empty list edge case
@@ -178,6 +191,9 @@ def test_eos_token_stripped_from_output():
         def __init__(self):
             self.eos_token_id = 2
             self.eos_token = "<|im_end|>"
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+            return "".join(m["content"] for m in messages)
         
         def decode(self, tokens):
             """Mock decode that shows EOS token if present."""
