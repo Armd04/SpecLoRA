@@ -87,30 +87,206 @@ class ModelManager:
         self._loaded = True
         logger.info("Models loaded successfully")
     
-    def load_lora_adapter(self, adapter_path: str) -> None:
+    def load_lora_adapter(self, adapter_path: str, fuse: bool = True) -> None:
         """
         Load a LoRA adapter into the draft model.
-        
+
+        Loads saved LoRA weights and either:
+        - fuse=True (default): Directly fuses weights into base model (efficient inference)
+        - fuse=False: Wraps target layers with LoRALinear for continued training
+
         Args:
-            adapter_path: Path to the LoRA adapter weights
+            adapter_path: Path to the LoRA adapter directory (must contain
+                          adapters.safetensors and adapter_config.json)
+            fuse: If True (default), immediately fuse LoRA weights into base
+                  model for efficient inference. If False, keep LoRA layers
+                  (useful for continued training).
         """
+        import json
+        from .training import LoRALinear, LoRAConfig, apply_lora_to_model
+
         if self.draft_model is None:
             raise RuntimeError("Draft model must be loaded first")
-        
-        logger.info(f"Loading LoRA adapter from: {adapter_path}")
-        
+
         adapter_path = Path(adapter_path)
         if not adapter_path.exists():
             raise FileNotFoundError(f"Adapter not found: {adapter_path}")
-        
+
+        config_path = adapter_path / "adapter_config.json"
+        weights_path = adapter_path / "adapters.safetensors"
+
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"adapter_config.json not found in {adapter_path}. "
+                "Please ensure the adapter was saved in MLX-LM compatible format."
+            )
+
+        if not weights_path.exists():
+            raise FileNotFoundError(
+                f"adapters.safetensors not found in {adapter_path}."
+            )
+
+        logger.info(f"Loading LoRA adapter from: {adapter_path}")
+
+        # Load adapter config
+        with open(config_path, "r") as f:
+            adapter_config = json.load(f)
+
         # Load adapter weights
-        adapter_weights = mx.load(str(adapter_path / "adapters.safetensors"))
-        
-        # Apply adapter weights to model
-        self.draft_model.load_weights(list(adapter_weights.items()))
+        lora_weights = mx.load(str(weights_path))
+
+        # Normalize weight names (handle both lora_A/lora_B and lora_a/lora_b)
+        normalized_weights = {}
+        for key, value in lora_weights.items():
+            # Convert MLX-LM format (lora_a, lora_b) to our format (lora_A, lora_B)
+            new_key = key.replace(".lora_a", ".lora_A").replace(".lora_b", ".lora_B")
+            normalized_weights[new_key] = value
+
+        if fuse:
+            # Directly fuse LoRA weights into base model
+            self._fuse_lora_weights_direct(normalized_weights, adapter_config)
+        else:
+            # Apply LoRA wrappers and load weights for continued training
+            lora_params = adapter_config.get("lora_parameters", {})
+            config = LoRAConfig(
+                rank=lora_params.get("rank", 8),
+                alpha=lora_params.get("scale", 16),  # MLX-LM uses 'scale'
+                dropout=lora_params.get("dropout", 0.0),
+            )
+            self.draft_model = apply_lora_to_model(self.draft_model, config)
+            self._load_lora_weights_into_model(normalized_weights)
+
         mx.eval(self.draft_model.parameters())
-        
-        logger.info("LoRA adapter loaded successfully")
+        logger.info(f"LoRA adapter loaded successfully (fused={fuse})")
+
+    def _fuse_lora_weights_direct(
+        self, lora_weights: Dict[str, mx.array], adapter_config: Dict[str, Any]
+    ) -> None:
+        """
+        Directly fuse LoRA weights into the base model without LoRA wrappers.
+
+        This is more efficient as it doesn't create intermediate LoRALinear layers.
+
+        Args:
+            lora_weights: Dictionary of LoRA weight tensors (lora_A, lora_B)
+            adapter_config: Adapter configuration with scaling info
+        """
+        lora_params = adapter_config.get("lora_parameters", {})
+        rank = lora_params.get("rank", 8)
+        alpha = lora_params.get("scale", 16)  # MLX-LM uses 'scale' not 'alpha'
+        scaling = alpha / rank
+
+        # Group lora_A and lora_B weights by layer path
+        lora_pairs = {}
+        for key, value in lora_weights.items():
+            if ".lora_A" in key:
+                base_path = key.replace(".lora_A", "")
+                if base_path not in lora_pairs:
+                    lora_pairs[base_path] = {}
+                lora_pairs[base_path]["A"] = value
+            elif ".lora_B" in key:
+                base_path = key.replace(".lora_B", "")
+                if base_path not in lora_pairs:
+                    lora_pairs[base_path] = {}
+                lora_pairs[base_path]["B"] = value
+
+        # Fuse each LoRA pair into the corresponding layer
+        fused_count = 0
+        for layer_path, pair in lora_pairs.items():
+            if "A" not in pair or "B" not in pair:
+                logger.warning(f"Incomplete LoRA pair for {layer_path}, skipping")
+                continue
+
+            # Navigate to the layer
+            try:
+                parts = layer_path.split(".")
+                module = self.draft_model
+                for part in parts[:-1]:
+                    module = getattr(module, part)
+                layer_name = parts[-1]
+                layer = getattr(module, layer_name)
+            except AttributeError as e:
+                logger.warning(f"Could not find layer {layer_path}: {e}")
+                continue
+
+            # Compute delta: (B @ A) * scaling
+            lora_A = pair["A"]  # (rank, in_features)
+            lora_B = pair["B"]  # (out_features, rank)
+            delta = (lora_B @ lora_A) * scaling
+
+            # Handle quantized layers
+            if hasattr(layer, 'scales'):
+                # Dequantize, add delta, re-quantize
+                weight = mx.dequantize(
+                    layer.weight,
+                    layer.scales,
+                    layer.biases,
+                    layer.group_size,
+                    layer.bits,
+                )
+                dtype = layer.scales.dtype
+                fused_weight = weight + delta.astype(dtype)
+
+                # Re-quantize
+                has_bias = hasattr(layer, 'bias') and layer.bias is not None
+                out_features, in_features = fused_weight.shape
+                temp_linear = nn.Linear(in_features, out_features, bias=has_bias)
+                temp_linear.weight = fused_weight
+                if has_bias:
+                    temp_linear.bias = layer.bias
+
+                new_layer = nn.QuantizedLinear.from_linear(
+                    temp_linear, layer.group_size, layer.bits
+                )
+            else:
+                # Regular linear layer
+                dtype = layer.weight.dtype
+                new_weight = layer.weight + delta.astype(dtype)
+
+                has_bias = hasattr(layer, 'bias') and layer.bias is not None
+                out_features, in_features = new_weight.shape
+                new_layer = nn.Linear(in_features, out_features, bias=has_bias)
+                new_layer.weight = new_weight
+                if has_bias:
+                    new_layer.bias = layer.bias
+
+            setattr(module, layer_name, new_layer)
+            fused_count += 1
+
+        # Validate fusion results
+        total_pairs = len(lora_pairs)
+        skipped = total_pairs - fused_count
+
+        if fused_count == 0:
+            raise ValueError(f"No LoRA layers were fused from {total_pairs} pairs. Check adapter format.")
+
+        if skipped > 0:
+            logger.warning(f"Fusion complete: {fused_count}/{total_pairs} layers fused, {skipped} skipped")
+        else:
+            logger.info(f"Fused {fused_count} LoRA layers directly into base model")
+
+    def _load_lora_weights_into_model(self, lora_weights: Dict[str, mx.array]) -> None:
+        """
+        Load LoRA weights into existing LoRALinear layers in the model.
+
+        Args:
+            lora_weights: Dictionary of LoRA weight tensors
+        """
+        from .training import LoRALinear
+
+        loaded_count = 0
+        for name, module in self.draft_model.named_modules():
+            if isinstance(module, LoRALinear):
+                lora_a_key = f"{name}.lora_A"
+                lora_b_key = f"{name}.lora_B"
+
+                if lora_a_key in lora_weights:
+                    module.lora_A = lora_weights[lora_a_key]
+                    loaded_count += 1
+                if lora_b_key in lora_weights:
+                    module.lora_B = lora_weights[lora_b_key]
+
+        logger.info(f"Loaded weights into {loaded_count} LoRA layers")
     
     def save_lora_adapter(self, save_path: str) -> None:
         """

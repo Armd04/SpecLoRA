@@ -206,26 +206,21 @@ def apply_lora_to_model(
 def get_lora_parameters(model: nn.Module) -> Dict[str, mx.array]:
     """
     Extract only LoRA parameters from the model.
-    
+
     Args:
         model: Model with LoRA adapters
-        
+
     Returns:
         Dictionary of LoRA parameter names to values
     """
     lora_params = {}
-    
-    def extract_recursive(module: nn.Module, prefix: str = "") -> None:
-        for name, child in module._modules.items():
-            full_name = f"{prefix}.{name}" if prefix else name
-            
-            if isinstance(child, LoRALinear):
-                lora_params[f"{full_name}.lora_A"] = child.lora_A
-                lora_params[f"{full_name}.lora_B"] = child.lora_B
-            elif hasattr(child, "_modules"):
-                extract_recursive(child, full_name)
-    
-    extract_recursive(model)
+
+    # Use named_modules() for recursive traversal - it yields (name, module) tuples
+    for name, module in model.named_modules():
+        if isinstance(module, LoRALinear):
+            lora_params[f"{name}.lora_A"] = module.lora_A
+            lora_params[f"{name}.lora_B"] = module.lora_B
+
     return lora_params
 
 
@@ -620,25 +615,51 @@ class LoRATrainer:
     
     def save_checkpoint(self, name: str) -> str:
         """
-        Save a training checkpoint.
-        
+        Save a training checkpoint in MLX-LM compatible format.
+
+        Saves adapters.safetensors with MLX-LM naming conventions (lora_a, lora_b)
+        and adapter_config.json for native MLX-LM loading.
+
         Args:
             name: Checkpoint name
-            
+
         Returns:
             Path to saved checkpoint
         """
+        import json
+
         checkpoint_path = self.checkpoint_dir / name
         checkpoint_path.mkdir(parents=True, exist_ok=True)
-        
-        # Save LoRA parameters
+
+        # Get LoRA parameters
         lora_params = get_lora_parameters(self.model)
+
+        # Convert naming to MLX-LM format: lora_A -> lora_a, lora_B -> lora_b
+        mlx_lora_params = {}
+        for key, value in lora_params.items():
+            new_key = key.replace(".lora_A", ".lora_a").replace(".lora_B", ".lora_b")
+            mlx_lora_params[new_key] = value
+
         mx.save_safetensors(
             str(checkpoint_path / "adapters.safetensors"),
-            lora_params,
+            mlx_lora_params,
         )
-        
-        # Save training state
+
+        # Save MLX-LM compatible adapter config
+        adapter_config = {
+            "fine_tune_type": "lora",
+            "num_layers": -1,  # All layers
+            "lora_parameters": {
+                "rank": self.lora_config.rank,
+                "scale": float(self.lora_config.alpha),  # MLX-LM uses 'scale' not 'alpha'
+                "dropout": self.lora_config.dropout,
+            },
+        }
+
+        with open(checkpoint_path / "adapter_config.json", "w") as f:
+            json.dump(adapter_config, f, indent=2)
+
+        # Also save trainer state for resume capability
         state = {
             "global_step": self.global_step,
             "best_loss": self.best_loss,
@@ -649,45 +670,165 @@ class LoRATrainer:
                 "target_modules": self.lora_config.target_modules,
             },
         }
-        
-        import json
+
         with open(checkpoint_path / "trainer_state.json", "w") as f:
             json.dump(state, f, indent=2)
-        
+
         logger.info(f"Saved checkpoint: {checkpoint_path}")
         return str(checkpoint_path)
     
     def load_checkpoint(self, checkpoint_path: str) -> None:
         """
         Load a training checkpoint.
-        
+
+        Handles backward compatibility for both old (lora_A/lora_B) and
+        new (lora_a/lora_b) naming conventions.
+
         Args:
             checkpoint_path: Path to checkpoint directory
         """
         checkpoint_path = Path(checkpoint_path)
-        
+
         # Load LoRA parameters
         lora_params = mx.load(str(checkpoint_path / "adapters.safetensors"))
-        
-        # Apply to model
+
+        # Normalize parameter names for backward compatibility
+        # Support both MLX-LM format (lora_a/lora_b) and our format (lora_A/lora_B)
+        normalized_params = {}
         for name, param in lora_params.items():
-            parts = name.split(".")
-            module = self.model
-            for part in parts[:-1]:
-                module = getattr(module, part)
-            setattr(module, parts[-1], param)
-        
+            # Convert MLX-LM format to our format
+            new_name = name.replace(".lora_a", ".lora_A").replace(".lora_b", ".lora_B")
+            normalized_params[new_name] = param
+
+        # Apply to LoRALinear modules in the model
+        loaded_count = 0
+        for module_name, module in self.model.named_modules():
+            if isinstance(module, LoRALinear):
+                lora_a_key = f"{module_name}.lora_A"
+                lora_b_key = f"{module_name}.lora_B"
+
+                if lora_a_key in normalized_params:
+                    module.lora_A = normalized_params[lora_a_key]
+                    loaded_count += 1
+                if lora_b_key in normalized_params:
+                    module.lora_B = normalized_params[lora_b_key]
+
+        if loaded_count == 0:
+            logger.warning(
+                "No LoRA parameters were loaded. Ensure the model has LoRA layers "
+                "applied before loading a checkpoint."
+            )
+
         mx.eval(self.model.parameters())
-        
+
         # Load training state
         import json
-        with open(checkpoint_path / "trainer_state.json", "r") as f:
-            state = json.load(f)
-        
-        self.global_step = state["global_step"]
-        self.best_loss = state["best_loss"]
-        
-        logger.info(f"Loaded checkpoint from: {checkpoint_path}")
+        state_path = checkpoint_path / "trainer_state.json"
+        if state_path.exists():
+            with open(state_path, "r") as f:
+                state = json.load(f)
+
+            self.global_step = state.get("global_step", 0)
+            self.best_loss = state.get("best_loss", float("inf"))
+        else:
+            logger.warning(f"trainer_state.json not found in {checkpoint_path}")
+
+        logger.info(f"Loaded checkpoint from: {checkpoint_path} ({loaded_count} LoRA layers)")
+
+    def fuse_and_get_model(self) -> nn.Module:
+        """
+        Fuse LoRA weights into base model and return a clean model for inference.
+
+        This method:
+        1. Merges LoRA adaptations into original layer weights
+        2. Replaces LoRALinear wrappers with clean nn.Linear layers
+        3. Returns model ready for efficient inference (no LoRA overhead)
+
+        Returns:
+            nn.Module: Clean model with fused weights, no LoRA wrappers
+        """
+        from mlx.utils import tree_unflatten
+
+        fused_layers = []
+
+        # Use named_modules() for recursive traversal - yields (name, module) tuples
+        for name, module in self.model.named_modules():
+            if isinstance(module, LoRALinear):
+                # Create fused linear layer
+                fused_linear = self._fuse_lora_linear(module)
+                fused_layers.append((name, fused_linear))
+
+        # Replace LoRA layers with fused clean layers
+        if fused_layers:
+            self.model.update_modules(tree_unflatten(fused_layers))
+
+        # Ensure model weights are evaluated
+        mx.eval(self.model.parameters())
+
+        logger.info(f"Fused {len(fused_layers)} LoRA layers into base model")
+
+        return self.model
+
+    def _fuse_lora_linear(self, lora_layer: LoRALinear) -> nn.Linear:
+        """
+        Fuse a single LoRALinear layer into a clean nn.Linear.
+
+        Handles both quantized and non-quantized layers.
+
+        Args:
+            lora_layer: The LoRA-wrapped linear layer
+
+        Returns:
+            nn.Linear or nn.QuantizedLinear: Clean linear layer with fused weights
+        """
+        original = lora_layer.original_layer
+
+        # Check if it's a quantized layer
+        is_quantized = hasattr(original, 'scales')
+
+        if is_quantized:
+            # Dequantize first for fusion
+            weight = mx.dequantize(
+                original.weight,
+                original.scales,
+                original.biases,
+                original.group_size,
+                original.bits,
+            )
+            dtype = original.scales.dtype
+        else:
+            weight = original.weight
+            dtype = weight.dtype
+
+        # Compute LoRA delta: (B @ A) * scaling
+        # lora_B is (out_features, rank), lora_A is (rank, in_features)
+        # Result is (out_features, in_features)
+        delta = (lora_layer.lora_B @ lora_layer.lora_A) * lora_layer.scaling
+        delta = delta.astype(dtype)
+
+        # Create fused weight
+        fused_weight = weight + delta
+
+        # Check for bias
+        has_bias = hasattr(original, 'bias') and original.bias is not None
+
+        # Create clean linear layer
+        out_features, in_features = fused_weight.shape
+        fused_linear = nn.Linear(in_features, out_features, bias=has_bias)
+        fused_linear.weight = fused_weight
+
+        if has_bias:
+            fused_linear.bias = original.bias
+
+        # Re-quantize if original was quantized
+        if is_quantized:
+            fused_linear = nn.QuantizedLinear.from_linear(
+                fused_linear,
+                original.group_size,
+                original.bits,
+            )
+
+        return fused_linear
 
 
 def quick_lora_finetune(

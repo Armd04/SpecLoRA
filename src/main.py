@@ -484,10 +484,14 @@ class SpeculativeDecodingSystem:
             num_epochs=num_epochs,
             save_every_n_steps=self.config["training"]["save_every_n_steps"],
         )
-        
-        # Update decoder with trained model
-        self.decoder.draft_model = trainer.model
-        
+
+        # Fuse LoRA weights and get clean model for efficient inference
+        # This removes the LoRA wrapper overhead that would otherwise slow down inference
+        clean_model = trainer.fuse_and_get_model()
+
+        # Update decoder with fused model for inference
+        self.decoder.draft_model = clean_model
+
         # Clear failure cases
         self.data_collector.clear_failure_cases()
         
