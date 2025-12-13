@@ -23,5 +23,6 @@ click>=8.1.7
 transformers>=4.36.0
 huggingface-hub>=0.20.0
 
-# Linting
+# Linting and pre-commit hooks
 ruff>=0.14.0
+pre-commit>=3.6.0
