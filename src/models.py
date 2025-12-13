@@ -461,28 +461,40 @@ def get_logits(
 def create_kv_cache(model: nn.Module) -> Any:
     """
     Initialize an empty KV cache for a model.
-    
+
     This creates a fresh cache that can be used for autoregressive generation.
     The cache structure depends on the model architecture (typically a list
-    of tuples containing key and value tensors for each layer).
-    
+    of KVCache objects for each layer).
+
     Args:
-        model: The language model (must have make_cache method)
-        
+        model: The language model
+
     Returns:
-        Initialized empty KV cache
+        Initialized empty KV cache (list of KVCache objects for MLX-LM models)
     """
-    # MLX models typically have a make_cache method
+    # Try MLX-LM's make_prompt_cache first (works with mlx_lm.load models)
+    try:
+        from mlx_lm.models.cache import make_prompt_cache
+        return make_prompt_cache(model)
+    except ImportError:
+        pass
+
+    # MLX models may have their own make_cache method
     if hasattr(model, 'make_cache'):
         return model.make_cache()
-    
+
     # Fallback: create cache manually based on model structure
     # Most transformer models have a layers attribute
     if hasattr(model, 'layers'):
         num_layers = len(model.layers)
-        # Return empty cache list - will be populated during forward pass
-        return [None] * num_layers
-    
+        # Return list of empty KVCache objects
+        try:
+            from mlx_lm.models.cache import KVCache
+            return [KVCache() for _ in range(num_layers)]
+        except ImportError:
+            # Last resort - return list of None (will be populated during forward pass)
+            return [None] * num_layers
+
     # If model doesn't support caching, return None
     logger.warning("Model doesn't support KV caching")
     return None
@@ -644,8 +656,14 @@ def _get_layer_cache_length(layer_cache: Any) -> int:
     """Get length from a single layer's cache."""
     if layer_cache is None:
         return 0
-    
-    # Handle tuple of (keys, values)
+
+    # PRIORITY 1: Handle MLX-LM's KVCache with offset tracking
+    # This MUST be checked first because KVCache pre-allocates keys/values
+    # to a larger size (e.g., 256), but offset tracks actual content length
+    if hasattr(layer_cache, 'offset'):
+        return layer_cache.offset
+
+    # PRIORITY 2: Handle tuple of (keys, values)
     if isinstance(layer_cache, tuple) and len(layer_cache) >= 1:
         keys = layer_cache[0]
         if keys is not None:
@@ -653,16 +671,12 @@ def _get_layer_cache_length(layer_cache: Any) -> int:
                 return keys.shape[2]  # [batch, heads, seq, dim]
             elif keys.ndim == 3:
                 return keys.shape[1]  # [batch, seq, hidden]
-    
-    # Handle object with keys attribute
+
+    # PRIORITY 3: Handle object with keys attribute but no offset
     if hasattr(layer_cache, 'keys') and layer_cache.keys is not None:
         if layer_cache.keys.ndim == 4:
             return layer_cache.keys.shape[2]
         elif layer_cache.keys.ndim == 3:
             return layer_cache.keys.shape[1]
-    
-    # Handle MLX-LM's offset tracking
-    if hasattr(layer_cache, 'offset'):
-        return layer_cache.offset
     
     return 0

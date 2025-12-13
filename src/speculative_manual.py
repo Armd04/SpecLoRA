@@ -9,6 +9,13 @@ The key difference from the built-in version:
 - Built-in: Fast, optimized, but only exposes overall acceptance rates
 - Manual: Comparable speed (with KV caching), captures every token decision for training
 
+Performance optimizations:
+- Both draft AND target models use KV caching for efficient generation
+- Draft model: cache is speculatively extended during drafting, then rewound
+- Target model: cache is extended during verification, rewound, then updated with
+  only accepted tokens. This avoids recomputing attention for the entire prefix
+  on every verification step (O(K) per step instead of O(N+K)).
+
 This enables more effective LoRA training by focusing gradients on specific
 positions where the draft model fails, rather than uniformly across sequences.
 """
@@ -104,20 +111,24 @@ class ManualSpeculativeResult:
 class ManualSpeculativeDecoder:
     """
     Manual speculative decoding implementation for data collection.
-    
+
     This class implements the speculative decoding algorithm manually to
     capture every token-level decision between the draft and target models.
-    
-    Algorithm overview:
-    1. Draft model generates K tokens autoregressively (using KV cache)
-    2. Target model verifies all K tokens in ONE forward pass
-    3. For each position, compare target's choice vs draft's prediction
-    4. Record disagreements with full context (tokens, confidences)
-    5. Accept tokens until first rejection, resample at rejection point
-    6. Update caches with accepted tokens and continue
 
-    With KV caching, performance should be comparable to MLX-LM's built-in
-    speculative decoding while providing much more valuable training signal.
+    Algorithm overview:
+    1. Initialize KV caches for BOTH draft and target models
+    2. Populate both caches with prompt tokens
+    3. Draft model generates K tokens autoregressively (using KV cache)
+    4. Target model verifies all K tokens in ONE forward pass (using KV cache)
+       - Only processes K draft tokens, not the full sequence (O(K) vs O(N+K))
+    5. For each position, compare target's choice vs draft's prediction
+    6. Record disagreements with full context (tokens, confidences)
+    7. Accept tokens until first rejection, resample at rejection point
+    8. Rewind both caches, then update with only accepted/corrected tokens
+    9. Continue until max_tokens or EOS
+
+    With KV caching on both models, performance is significantly better than
+    naive full-sequence verification while providing detailed training signal.
     """
     
     def __init__(
@@ -226,31 +237,40 @@ class ManualSpeculativeDecoder:
         draft_token: int,
         draft_prob: float,
         target_logits: mx.array,
+        debug: bool = False,
     ) -> Tuple[bool, int, float]:
         """
         Verify a draft token against target model's prediction.
-        
+
         Uses greedy comparison: accept if target's argmax matches draft.
         For temperature > 0, uses probabilistic acceptance.
-        
+
         Args:
             draft_token: Token proposed by draft model
             draft_prob: Probability draft assigned to this token
             target_logits: Target model's logits for this position
-            
+            debug: If True, print debug information
+
         Returns:
             Tuple of (accepted, final_token, target_prob)
         """
+        # Ensure we have evaluated the logits
+        mx.eval(target_logits)
+
         if target_logits.ndim > 1:
             target_logits = target_logits.reshape(-1)
-        
+
         target_probs = mx.softmax(target_logits, axis=-1)
-        
+        mx.eval(target_probs)
+
         if self.temperature == 0:
             # Greedy verification
             target_choice = mx.argmax(target_logits).item()
             accepted = (target_choice == draft_token)
-            
+
+            if debug:
+                logger.info(f"  Greedy verify: draft={draft_token}, target_argmax={target_choice}, accepted={accepted}")
+
             if accepted:
                 return True, draft_token, target_probs[draft_token].item()
             else:
@@ -259,9 +279,19 @@ class ManualSpeculativeDecoder:
             # Probabilistic acceptance: accept with prob min(1, p_target/p_draft)
             target_prob_for_draft = target_probs[draft_token].item()
             acceptance_ratio = min(1.0, target_prob_for_draft / max(draft_prob, 1e-10))
-            
+
             r = mx.random.uniform().item()
-            if r < acceptance_ratio:
+            accepted = r < acceptance_ratio
+
+            if debug:
+                target_argmax = mx.argmax(target_logits).item()
+                logger.info(
+                    f"  Prob verify: draft={draft_token} (p={draft_prob:.4f}), "
+                    f"target_argmax={target_argmax}, target_p_for_draft={target_prob_for_draft:.4f}, "
+                    f"ratio={acceptance_ratio:.4f}, r={r:.4f}, accepted={accepted}"
+                )
+
+            if accepted:
                 return True, draft_token, target_prob_for_draft
             else:
                 # Sample from target distribution
@@ -274,19 +304,22 @@ class ManualSpeculativeDecoder:
         prompt: str,
         max_tokens: int = 256,
         K: Optional[int] = None,
+        debug: bool = False,
     ) -> ManualSpeculativeResult:
         """
         Generate text using manual speculative decoding with full data collection.
-        
+
         Args:
             prompt: Input prompt text
             max_tokens: Maximum tokens to generate
             K: Number of draft tokens per step (defaults to self.num_draft_tokens)
-            
+            debug: If True, print detailed debug information for first few iterations
+
         Returns:
             ManualSpeculativeResult with generated text and detailed disagreement data
         """
         K = K or self.num_draft_tokens
+        debug_iterations = 3 if debug else 0  # Debug first 3 iterations
         
         start_time = time.time()
         metrics = ManualSpeculativeMetrics()
@@ -301,24 +334,48 @@ class ManualSpeculativeDecoder:
         generated_tokens: List[int] = []
 
         # ============================================================
-        # Initialize KV cache for draft model
+        # Initialize KV caches for both draft and target models
         # ============================================================
         draft_cache = create_kv_cache(self.draft_model)
+        target_cache = create_kv_cache(self.target_model)
 
-        # Populate cache with the prompt and get initial logits
+        # Populate both caches with the prompt
         prompt_input = mx.array(all_tokens)[None, :]
+
+        # Draft cache: get initial logits for first draft token
         draft_logits, draft_cache = get_logits_with_cache(self.draft_model, prompt_input, draft_cache)
         mx.eval(draft_cache)
         mx.eval(draft_logits)
+
+        # Target cache: populate and save logits for verifying first draft token
+        target_logits, target_cache = get_logits_with_cache(self.target_model, prompt_input, target_cache)
+        mx.eval(target_cache)
+        mx.eval(target_logits)
 
         # Save logits for next position (will be used for first draft token)
         next_position_logits = draft_logits[0, -1, :]
         mx.eval(next_position_logits)  # Evaluate to avoid lazy recomputation
 
+        # Save target logits for verifying first draft token of first iteration
+        # target_logits[0, -1, :] predicts position len(all_tokens), i.e., where draft_tokens[0] goes
+        target_next_position_logits = target_logits[0, -1, :]
+        mx.eval(target_next_position_logits)
+
         # Main generation loop
+        iteration_count = 0
         while len(generated_tokens) < max_tokens:
+            iteration_count += 1
+            should_debug = debug and (iteration_count <= debug_iterations)
+
+            if should_debug:
+                logger.info(f"\n{'='*60}")
+                logger.info(f"ITERATION {iteration_count}")
+                logger.info(f"  generated_tokens so far: {len(generated_tokens)}")
+                logger.info(f"  all_tokens length: {len(all_tokens)}")
+                logger.info(f"{'='*60}")
+
             draft_start = time.time()
-            
+
             # ============================================================
             # DRAFT PHASE: Generate K tokens from draft model (WITH KV CACHE)
             # ============================================================
@@ -334,6 +391,13 @@ class ManualSpeculativeDecoder:
 
             # Generate K draft tokens autoregressively using cache
             for k in range(K):
+                if should_debug:
+                    mx.eval(current_logits)
+                    draft_argmax = mx.argmax(current_logits).item()
+                    decoded_argmax = self.tokenizer.decode([draft_argmax])
+                    cache_len = get_cache_length(draft_cache)
+                    logger.info(f"  DRAFT k={k}: cache_len={cache_len}, logits argmax={draft_argmax} ('{decoded_argmax}')")
+
                 # Sample from draft model's prediction
                 token, prob = self._sample_token(current_logits)
                 draft_tokens.append(token)
@@ -355,6 +419,13 @@ class ManualSpeculativeDecoder:
                     mx.eval(draft_output)
                     mx.eval(draft_cache)
                     current_logits = draft_output[0, -1, :]
+                    mx.eval(current_logits)
+
+            if should_debug:
+                logger.info(f"DRAFT PHASE: Generated {len(draft_tokens)} draft tokens")
+                for idx, (dt, dp) in enumerate(zip(draft_tokens, draft_probs)):
+                    decoded = self.tokenizer.decode([dt])
+                    logger.info(f"  draft[{idx}]: token={dt} ('{decoded}'), prob={dp:.4f}")
 
             # Rewind draft cache to remove speculative draft tokens
             # Cache should have grown by len(draft_tokens)-1 tokens (last token not added)
@@ -378,42 +449,69 @@ class ManualSpeculativeDecoder:
                 break
             
             # ============================================================
-            # VERIFY PHASE: Run target model to verify draft tokens
+            # VERIFY PHASE: Run target model to verify draft tokens (WITH KV CACHE)
             # ============================================================
             verify_start = time.time()
-            
-            # Run target on sequence + all draft tokens
-            verify_sequence = all_tokens + draft_tokens
-            verify_input = mx.array(verify_sequence)[None, :]
-            target_output = self.target_model(verify_input)
+
+            # Save target cache position - we'll rewind to keep only accepted tokens
+            target_cache_position_before_verify = get_cache_length(target_cache)
+
+            # Run target ONLY on draft tokens (cache already has all_tokens)
+            # This is O(K) instead of O(N+K) where N = len(all_tokens)
+            verify_input = mx.array(draft_tokens)[None, :]
+            target_output, target_cache = get_logits_with_cache(
+                self.target_model, verify_input, target_cache
+            )
             mx.eval(target_output)
-            
+            mx.eval(target_cache)
+
             metrics.verify_time_seconds += time.time() - verify_start
-            
+
+            if should_debug:
+                logger.info(f"VERIFY PHASE: target_output shape = {target_output.shape}")
+                logger.info(f"  target_next_position_logits shape = {target_next_position_logits.shape}")
+                # Check what target would sample vs what draft proposed
+                target_argmax_0 = mx.argmax(target_next_position_logits).item()
+                decoded_target = self.tokenizer.decode([target_argmax_0])
+                decoded_draft = self.tokenizer.decode([draft_tokens[0]])
+                logger.info(f"  For k=0: target_argmax={target_argmax_0} ('{decoded_target}'), draft={draft_tokens[0]} ('{decoded_draft}')")
+
             # ============================================================
             # COMPARE: Check each draft token against target's prediction
             # ============================================================
-            # 
-            # Key insight: target_output[0, i, :] contains logits for predicting
-            # position i+1. So to verify draft_tokens[k], we look at
-            # target_output[0, len(all_tokens) - 1 + k, :]
             #
-            # Position len(all_tokens) - 1 is the last prompt token,
-            # and its output predicts what should come at len(all_tokens),
-            # which is where draft_tokens[0] is.
-            
+            # With KV caching, the logit indexing is off-by-one from the full forward pass:
+            # - target_next_position_logits (saved from previous iteration) predicts position N,
+            #   which verifies draft_tokens[0]
+            # - target_output[0, k-1, :] predicts position N+k, which verifies draft_tokens[k]
+            #   for k >= 1
+            #
+            # This is because processing draft_tokens[j] outputs logits for position N+j+1,
+            # not N+j.
+
             accepted_count = 0
             final_tokens: List[int] = []
-            
+
             for k, (draft_token, draft_prob) in enumerate(zip(draft_tokens, draft_probs)):
-                # Target logits that predict position (len(all_tokens) + k)
-                # These are at output position (len(all_tokens) - 1 + k)
-                target_pos = len(all_tokens) - 1 + k
-                target_logits = target_output[0, target_pos, :]
-                
+                # Get the correct logits for verifying draft_tokens[k]
+                if k == 0:
+                    # First draft token: use saved logits from previous iteration
+                    target_logits_for_verify = target_next_position_logits
+                else:
+                    # Subsequent tokens: target_output[0, k-1, :] predicts position N+k
+                    target_logits_for_verify = target_output[0, k - 1, :]
+
+                if should_debug:
+                    mx.eval(target_logits_for_verify)
+                    verify_argmax = mx.argmax(target_logits_for_verify).item()
+                    decoded_verify = self.tokenizer.decode([verify_argmax])
+                    decoded_draft = self.tokenizer.decode([draft_token])
+                    logger.info(f"  k={k}: verify using {'saved' if k==0 else f'target_output[0,{k-1},:]'}, "
+                               f"argmax={verify_argmax} ('{decoded_verify}'), draft={draft_token} ('{decoded_draft}')")
+
                 # Verify
                 accepted, final_token, target_prob = self._verify_and_accept(
-                    draft_token, draft_prob, target_logits
+                    draft_token, draft_prob, target_logits_for_verify, debug=should_debug
                 )
                 
                 if accepted:
@@ -445,25 +543,84 @@ class ManualSpeculativeDecoder:
                     break
             
             metrics.draft_tokens_accepted += accepted_count
-            
+
+            if should_debug:
+                logger.info(f"COMPARE RESULT: accepted={accepted_count}/{len(draft_tokens)}")
+                logger.info(f"  final_tokens: {final_tokens}")
+                for idx, ft in enumerate(final_tokens):
+                    decoded = self.tokenizer.decode([ft])
+                    logger.info(f"    [{idx}]: token={ft} ('{decoded}')")
+
             # ============================================================
-            # UPDATE: Add accepted/corrected tokens to sequence and update cache
+            # UPDATE: Add accepted/corrected tokens to sequence and update caches
             # ============================================================
+            #
+            # OPTIMIZATION: The target cache already contains the draft tokens from
+            # verification. We only need to:
+            # 1. Keep the accepted tokens (rewind to N + accepted_count)
+            # 2. If there's a corrected token, process just that one token
+            # 3. If all tokens were accepted, use logits from verification output
+
+            # Truncate final_tokens if they would exceed max_tokens
+            remaining_capacity = max_tokens - len(generated_tokens)
+            if len(final_tokens) > remaining_capacity:
+                final_tokens = final_tokens[:remaining_capacity]
+                # Recount accepted tokens after truncation
+                # (truncation might cut off the corrected token or some accepted ones)
+                accepted_count = min(accepted_count, len(final_tokens))
+
             if final_tokens:
                 all_tokens.extend(final_tokens)
                 generated_tokens.extend(final_tokens)
 
-                # Update draft cache with accepted tokens and get logits for next iteration
+                # Update draft cache with all final tokens
                 accepted_input = mx.array(final_tokens)[None, :]
                 draft_output, draft_cache = get_logits_with_cache(
                     self.draft_model, accepted_input, draft_cache
                 )
                 mx.eval(draft_cache)
                 mx.eval(draft_output)
-
-                # Save logits for next draft token
                 next_position_logits = draft_output[0, -1, :]
-                mx.eval(next_position_logits)  # Evaluate to avoid lazy recomputation
+                mx.eval(next_position_logits)
+
+                # For target cache: optimize based on whether all tokens were accepted
+                all_accepted = (accepted_count == len(final_tokens))
+
+                if all_accepted:
+                    # All draft tokens accepted - cache already has correct tokens!
+                    # Just rewind to keep exactly len(final_tokens) and use existing logits
+                    target_cache = rewind_cache(
+                        target_cache,
+                        target_cache_position_before_verify + len(final_tokens)
+                    )
+                    mx.eval(target_cache)
+
+                    # Get next logits from the verification output
+                    # target_output[0, K-1, :] predicts position N+K (next position)
+                    # But we need to handle the case where K tokens were drafted
+                    # and target_output has shape [1, K, vocab]
+                    target_next_position_logits = target_output[0, len(final_tokens) - 1, :]
+                    mx.eval(target_next_position_logits)
+                else:
+                    # Some tokens rejected - need to fix the cache
+                    # Rewind to keep only the accepted tokens (not the corrected one yet)
+                    target_cache = rewind_cache(
+                        target_cache,
+                        target_cache_position_before_verify + accepted_count
+                    )
+                    mx.eval(target_cache)
+
+                    # Process only the corrected token to update cache and get next logits
+                    corrected_token = final_tokens[-1]
+                    corrected_input = mx.array([[corrected_token]])
+                    target_correction_output, target_cache = get_logits_with_cache(
+                        self.target_model, corrected_input, target_cache
+                    )
+                    mx.eval(target_cache)
+                    mx.eval(target_correction_output)
+
+                    target_next_position_logits = target_correction_output[0, -1, :]
+                    mx.eval(target_next_position_logits)
 
             # Check for EOS
             if generated_tokens and generated_tokens[-1] == self.eos_token_id:

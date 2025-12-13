@@ -146,24 +146,25 @@ class SpeculativeDecodingSystem:
         prompt: str,
         max_tokens: Optional[int] = None,
         collect_data: bool = True,
-        mode: str = "fast",
+        implementation: str = "manual",
     ) -> str:
         """
         Generate text using speculative decoding.
-        
+
         Args:
             prompt: Input prompt
             max_tokens: Maximum tokens to generate
             collect_data: Whether to collect training data
-            mode: "fast" for built-in speculative decoding, 
-                  "detailed" for manual implementation with token-level data
-            
+            implementation: "manual" for our implementation with KV-cached target verification
+                           and token-level data collection (default, recommended),
+                           "builtin" for MLX-LM's built-in speculative decoding
+
         Returns:
             Generated text
         """
         if not self._initialized:
             self.initialize()
-        
+
         max_tokens = max_tokens or self.config["speculative"]["max_tokens"]
 
         # Clear cache periodically to prevent memory accumulation
@@ -172,7 +173,7 @@ class SpeculativeDecodingSystem:
             self.model_manager.clear_cache()
             logger.debug(f"Cleared cache after {self._generation_count} generations")
 
-        if mode == "detailed":
+        if implementation == "manual":
             # Use manual speculative decoding for detailed data collection
             result = self.decoder.generate_detailed(
                 prompt=prompt,
@@ -219,7 +220,7 @@ class SpeculativeDecodingSystem:
                     )
             
             # Display detailed metrics
-            metrics_table = Table(title="Generation Metrics (Detailed Mode)", show_header=False)
+            metrics_table = Table(title="Generation Metrics (Manual Spec-Dec)", show_header=False)
             metrics_table.add_row("Acceptance Rate", f"{result.metrics.acceptance_rate:.1%}")
             metrics_table.add_row("Tokens/Second", f"{result.metrics.tokens_per_second:.1f}")
             metrics_table.add_row("Total Tokens", str(result.metrics.total_tokens_generated))
@@ -238,7 +239,7 @@ class SpeculativeDecodingSystem:
             return result.text
         
         else:
-            # Use fast built-in speculative decoding
+            # Use MLX-LM's built-in speculative decoding
             result = self.decoder.generate(
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -260,9 +261,9 @@ class SpeculativeDecodingSystem:
                         "[yellow]Training threshold reached! "
                         "Run 'train' command to fine-tune the draft model.[/yellow]"
                     )
-            
+
             # Display metrics
-            metrics_table = Table(title="Generation Metrics", show_header=False)
+            metrics_table = Table(title="Generation Metrics (MLX-LM Built-in)", show_header=False)
             metrics_table.add_row("Acceptance Rate", f"{result.metrics.acceptance_rate:.1%}")
             metrics_table.add_row("Tokens/Second", f"{result.metrics.tokens_per_second:.1f}")
             metrics_table.add_row("Total Tokens", str(result.metrics.total_tokens_generated))
@@ -569,12 +570,18 @@ class SpeculativeDecodingSystem:
             "tracker": tracker_stats,
         }
     
-    def interactive_mode(self) -> None:
-        """Run interactive generation mode."""
+    def interactive_mode(self, implementation: str = "manual") -> None:
+        """Run interactive generation mode.
+
+        Args:
+            implementation: "manual" (default) or "builtin" for spec dec implementation
+        """
         if not self._initialized:
             self.initialize()
-        
+
+        impl_desc = "Manual Spec-Dec" if implementation == "manual" else "MLX-LM Built-in"
         console.print(Panel(
+            f"Implementation: [cyan]{impl_desc}[/cyan]\n\n"
             "Enter prompts to generate text. Commands:\n"
             "  /quit - Exit interactive mode\n"
             "  /stats - Show statistics\n"
@@ -583,17 +590,17 @@ class SpeculativeDecodingSystem:
             "  /clear - Clear screen",
             title="Interactive Mode",
         ))
-        
+
         while True:
             try:
                 prompt = console.input("\n[bold green]Prompt:[/bold green] ")
-                
+
                 if not prompt:
                     continue
-                
+
                 if prompt.startswith("/"):
                     cmd = prompt[1:].lower().strip()
-                    
+
                     if cmd == "quit" or cmd == "exit":
                         break
                     elif cmd == "stats":
@@ -608,18 +615,18 @@ class SpeculativeDecodingSystem:
                     else:
                         console.print(f"[red]Unknown command: {cmd}[/red]")
                     continue
-                
+
                 # Generate response
                 console.print("\n[bold blue]Response:[/bold blue]")
-                response = self.generate(prompt)
+                response = self.generate(prompt, implementation=implementation)
                 console.print(response)
-                
+
             except KeyboardInterrupt:
                 console.print("\n[yellow]Interrupted. Type /quit to exit.[/yellow]")
             except Exception as e:
                 console.print(f"[red]Error: {e}[/red]")
                 logger.exception("Error during generation")
-        
+
         # Save tracker data on exit
         tracker_path = Path(self.config["data"]["failures_dir"]) / "rate_tracker.json"
         self.rate_tracker.save(str(tracker_path))
@@ -641,27 +648,28 @@ def cli(ctx, config):
 @click.option("--max-tokens", "-m", default=256, help="Maximum tokens to generate")
 @click.option("--no-collect", is_flag=True, help="Disable data collection")
 @click.option(
-    "--mode",
-    type=click.Choice(["fast", "detailed"]),
-    default="fast",
-    help="Generation mode: 'fast' uses MLX-LM's optimized speculative decoding, "
-         "'detailed' uses manual implementation that captures token-level disagreements"
+    "--implementation", "-i",
+    type=click.Choice(["manual", "builtin"]),
+    default="manual",
+    help="Speculative decoding implementation: 'manual' (default) uses our implementation "
+         "with KV-cached target verification and token-level data collection, "
+         "'builtin' uses MLX-LM's built-in speculative decoding"
 )
 @click.pass_context
-def generate(ctx, prompt, max_tokens, no_collect, mode):
+def generate(ctx, prompt, max_tokens, no_collect, implementation):
     """Generate text using speculative decoding.
-    
-    Modes:
-    - fast: Uses MLX-LM's built-in speculative decoding (default, recommended for production)
-    - detailed: Uses manual implementation that captures every token-level disagreement 
-      (slower ~20%, but provides more valuable training data)
+
+    Implementations:
+    - manual (default): Our implementation with KV-cached target verification.
+      Captures token-level disagreements for training data collection.
+    - builtin: MLX-LM's built-in speculative decoding.
     """
     system = SpeculativeDecodingSystem(ctx.obj["config"])
     response = system.generate(
-        prompt, 
-        max_tokens=max_tokens, 
+        prompt,
+        max_tokens=max_tokens,
         collect_data=not no_collect,
-        mode=mode,
+        implementation=implementation,
     )
     console.print(f"\n[bold]Response:[/bold]\n{response}")
 
@@ -718,81 +726,133 @@ def stats(ctx):
 
 
 @cli.command()
+@click.option(
+    "--implementation", "-i",
+    type=click.Choice(["manual", "builtin"]),
+    default="manual",
+    help="Speculative decoding implementation: 'manual' (default) or 'builtin'"
+)
 @click.pass_context
-def interactive(ctx):
-    """Run interactive generation mode."""
+def interactive(ctx, implementation):
+    """Run interactive generation mode.
+
+    Uses the manual speculative decoding implementation by default,
+    which provides KV-cached target verification and token-level data collection.
+    """
     system = SpeculativeDecodingSystem(ctx.obj["config"])
-    system.interactive_mode()
+    system.interactive_mode(implementation=implementation)
 
 
 @cli.command()
 @click.option("--prompt", "-p", required=True, help="Test prompt")
 @click.option("--iterations", "-n", default=5, help="Number of iterations")
 @click.option("--max-tokens", "-m", default=128, help="Maximum tokens to generate")
+@click.option(
+    "--implementation", "-i",
+    type=click.Choice(["manual", "builtin"]),
+    default="manual",
+    help="Speculative decoding implementation to benchmark: 'manual' (default) or 'builtin'"
+)
 @click.pass_context
-def benchmark(ctx, prompt, iterations, max_tokens):
-    """Benchmark speculative vs standard decoding."""
+def benchmark(ctx, prompt, iterations, max_tokens, implementation):
+    """Benchmark speculative vs standard decoding.
+
+    Compares the selected speculative decoding implementation against
+    standard autoregressive decoding with the target model.
+    """
     system = SpeculativeDecodingSystem(ctx.obj["config"])
     system.initialize()
-    
+
     import time
-    
+
+    # Create manual decoder if needed
+    manual_decoder = system.decoder.create_manual_decoder()
+
+    # Get the formatted prompt length for token counting
+    formatted_prompt = system.decoder._format_prompt(prompt)
+    prompt_token_count = len(system.decoder.tokenizer.encode(formatted_prompt))
+
     # Warm up
     console.print("[cyan]Warming up...[/cyan]")
-    _ = system.decoder.generate(prompt, max_tokens=32)
-    
+    if implementation == "manual":
+        _ = manual_decoder.generate(prompt, max_tokens=32)
+    else:
+        _ = system.decoder.generate(prompt, max_tokens=32)
+
     # Benchmark speculative decoding
-    console.print("[cyan]Benchmarking speculative decoding...[/cyan]")
+    impl_name = "Manual Spec-Dec" if implementation == "manual" else "MLX-LM Spec-Dec"
+    console.print(f"[cyan]Benchmarking {impl_name}...[/cyan]")
     spec_times = []
     spec_tokens = []
-    
+    spec_acceptance_rates = []
+
     for _ in range(iterations):
         start = time.time()
-        result = system.decoder.generate(prompt, max_tokens=max_tokens, collect_training_data=False)
-        elapsed = time.time() - start
+        if implementation == "manual":
+            result = manual_decoder.generate(prompt, max_tokens=max_tokens)
+            elapsed = time.time() - start
+            spec_tokens.append(result.metrics.total_tokens_generated)
+            spec_acceptance_rates.append(result.metrics.acceptance_rate)
+        else:
+            result = system.decoder.generate(prompt, max_tokens=max_tokens, collect_training_data=False)
+            elapsed = time.time() - start
+            spec_tokens.append(result.metrics.total_tokens_generated)
+            spec_acceptance_rates.append(result.metrics.acceptance_rate)
         spec_times.append(elapsed)
-        spec_tokens.append(result.metrics.total_tokens_generated)
-    
+
     # Benchmark standard decoding (target model)
     console.print("[cyan]Benchmarking standard decoding (target model)...[/cyan]")
     std_times = []
     std_tokens = []
-    
+
     for _ in range(iterations):
         start = time.time()
         text, elapsed = system.decoder.generate_standard(prompt, max_tokens=max_tokens, use_target=True)
         std_times.append(elapsed)
-        std_tokens.append(len(system.decoder.tokenizer.encode(text)))
-    
+        # Count only generated tokens (total - prompt)
+        total_tokens = len(system.decoder.tokenizer.encode(text))
+        generated_tokens = max(0, total_tokens - prompt_token_count)
+        std_tokens.append(generated_tokens)
+
     # Results
     avg_spec_time = sum(spec_times) / len(spec_times)
     avg_std_time = sum(std_times) / len(std_times)
     avg_spec_tokens = sum(spec_tokens) / len(spec_tokens)
     avg_std_tokens = sum(std_tokens) / len(std_tokens)
-    
-    table = Table(title="Benchmark Results")
+    avg_acceptance_rate = sum(spec_acceptance_rates) / len(spec_acceptance_rates)
+
+    table = Table(title=f"Benchmark Results ({impl_name})")
     table.add_column("Method")
     table.add_column("Avg Time (s)")
     table.add_column("Avg Tokens")
     table.add_column("Tokens/s")
-    
+
     table.add_row(
-        "Speculative",
+        impl_name,
         f"{avg_spec_time:.2f}",
         f"{avg_spec_tokens:.0f}",
         f"{avg_spec_tokens/avg_spec_time:.1f}",
     )
     table.add_row(
-        "Standard",
+        "Standard (Target)",
         f"{avg_std_time:.2f}",
         f"{avg_std_tokens:.0f}",
         f"{avg_std_tokens/avg_std_time:.1f}",
     )
-    
+
     console.print(table)
-    
+
     speedup = avg_std_time / avg_spec_time
     console.print(f"\n[bold]Speedup: {speedup:.2f}x[/bold]")
+    console.print(f"[cyan]Acceptance Rate: {avg_acceptance_rate:.1%}[/cyan]")
+
+    # Warn if acceptance rate is too low for speedup
+    if avg_acceptance_rate < 0.6:
+        console.print(
+            f"\n[yellow]⚠ Low acceptance rate ({avg_acceptance_rate:.1%}). "
+            f"Speculative decoding needs >60% acceptance to provide speedup. "
+            f"Consider training the draft model on failure cases.[/yellow]"
+        )
 
 
 @cli.command("collect-data")
