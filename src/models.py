@@ -21,12 +21,12 @@ logger = logging.getLogger(__name__)
 class ModelManager:
     """
     Manages loading and caching of target and draft models.
-    
+
     The target model is the larger, more accurate model that verifies
     draft tokens. The draft model is smaller and faster, used to
     generate candidate tokens speculatively.
     """
-    
+
     def __init__(
         self,
         target_model_name: str,
@@ -35,7 +35,7 @@ class ModelManager:
     ):
         """
         Initialize the model manager.
-        
+
         Args:
             target_model_name: HuggingFace model path for target model
             draft_model_name: HuggingFace model path for draft model
@@ -44,49 +44,49 @@ class ModelManager:
         self.target_model_name = target_model_name
         self.draft_model_name = draft_model_name
         self.lora_path = lora_path
-        
+
         self.target_model = None
         self.target_tokenizer = None
         self.draft_model = None
         self.draft_tokenizer = None
-        
+
         self._loaded = False
-    
+
     def load_models(self) -> None:
         """
         Load both target and draft models into memory.
-        
+
         This uses MLX's efficient memory mapping to minimize RAM usage.
         The target model should be 4-bit quantized.
         """
         logger.info(f"Loading target model: {self.target_model_name}")
-        
+
         # Load target model (quantized)
         self.target_model, self.target_tokenizer = load(
             self.target_model_name,
             lazy=True,  # Lazy loading for memory efficiency
         )
-        
+
         # Ensure model weights are evaluated
         mx.eval(self.target_model.parameters())
-        
+
         logger.info(f"Loading draft model: {self.draft_model_name}")
-        
+
         # Load draft model (can be FP16 for training)
         self.draft_model, self.draft_tokenizer = load(
             self.draft_model_name,
             lazy=True,
         )
-        
+
         mx.eval(self.draft_model.parameters())
-        
+
         # Load LoRA adapter if specified
         if self.lora_path and Path(self.lora_path).exists():
             self.load_lora_adapter(self.lora_path)
-        
+
         self._loaded = True
         logger.info("Models loaded successfully")
-    
+
     def load_lora_adapter(self, adapter_path: str, fuse: bool = True) -> None:
         """
         Load a LoRA adapter into the draft model.
@@ -103,7 +103,7 @@ class ModelManager:
                   (useful for continued training).
         """
         import json
-        from .training import LoRALinear, LoRAConfig, apply_lora_to_model
+        from .training import LoRAConfig, apply_lora_to_model
 
         if self.draft_model is None:
             raise RuntimeError("Draft model must be loaded first")
@@ -215,7 +215,7 @@ class ModelManager:
             delta = (lora_B @ lora_A) * scaling
 
             # Handle quantized layers
-            if hasattr(layer, 'scales'):
+            if hasattr(layer, "scales"):
                 # Dequantize, add delta, re-quantize
                 weight = mx.dequantize(
                     layer.weight,
@@ -228,7 +228,7 @@ class ModelManager:
                 fused_weight = weight + delta.astype(dtype)
 
                 # Re-quantize
-                has_bias = hasattr(layer, 'bias') and layer.bias is not None
+                has_bias = hasattr(layer, "bias") and layer.bias is not None
                 out_features, in_features = fused_weight.shape
                 temp_linear = nn.Linear(in_features, out_features, bias=has_bias)
                 temp_linear.weight = fused_weight
@@ -243,7 +243,7 @@ class ModelManager:
                 dtype = layer.weight.dtype
                 new_weight = layer.weight + delta.astype(dtype)
 
-                has_bias = hasattr(layer, 'bias') and layer.bias is not None
+                has_bias = hasattr(layer, "bias") and layer.bias is not None
                 out_features, in_features = new_weight.shape
                 new_layer = nn.Linear(in_features, out_features, bias=has_bias)
                 new_layer.weight = new_weight
@@ -258,10 +258,14 @@ class ModelManager:
         skipped = total_pairs - fused_count
 
         if fused_count == 0:
-            raise ValueError(f"No LoRA layers were fused from {total_pairs} pairs. Check adapter format.")
+            raise ValueError(
+                f"No LoRA layers were fused from {total_pairs} pairs. Check adapter format."
+            )
 
         if skipped > 0:
-            logger.warning(f"Fusion complete: {fused_count}/{total_pairs} layers fused, {skipped} skipped")
+            logger.warning(
+                f"Fusion complete: {fused_count}/{total_pairs} layers fused, {skipped} skipped"
+            )
         else:
             logger.info(f"Fused {fused_count} LoRA layers directly into base model")
 
@@ -287,62 +291,64 @@ class ModelManager:
                     module.lora_B = lora_weights[lora_b_key]
 
         logger.info(f"Loaded weights into {loaded_count} LoRA layers")
-    
+
     def save_lora_adapter(self, save_path: str) -> None:
         """
         Save the current LoRA adapter weights.
-        
+
         Args:
             save_path: Directory to save the adapter
         """
         if self.draft_model is None:
             raise RuntimeError("Draft model must be loaded first")
-        
+
         save_path = Path(save_path)
         save_path.mkdir(parents=True, exist_ok=True)
-        
+
         # Extract LoRA weights (weights with 'lora' in name)
         lora_weights = {
-            k: v for k, v in self.draft_model.parameters().items()
-            if 'lora' in k.lower()
+            k: v
+            for k, v in self.draft_model.parameters().items()
+            if "lora" in k.lower()
         }
-        
+
         if lora_weights:
             mx.save_safetensors(str(save_path / "adapters.safetensors"), lora_weights)
             logger.info(f"LoRA adapter saved to: {save_path}")
         else:
             logger.warning("No LoRA weights found to save")
-    
+
     def get_target_model(self) -> Tuple[nn.Module, Any]:
         """Get the target model and tokenizer."""
         if not self._loaded:
             raise RuntimeError("Models not loaded. Call load_models() first.")
         return self.target_model, self.target_tokenizer
-    
+
     def get_draft_model(self) -> Tuple[nn.Module, Any]:
         """Get the draft model and tokenizer."""
         if not self._loaded:
             raise RuntimeError("Models not loaded. Call load_models() first.")
         return self.draft_model, self.draft_tokenizer
-    
+
     def clear_cache(self) -> None:
         """Clear MLX memory cache to free up RAM."""
         mx.clear_cache()
         logger.debug("Memory cache cleared")
-    
+
     def get_vocab_size(self) -> int:
         """Get the vocabulary size (should be same for both models)."""
         if not self._loaded:
             raise RuntimeError("Models not loaded")
         return self.target_tokenizer.vocab_size
-    
+
     def estimate_memory_usage(self) -> Dict[str, float]:
         """
         Estimate memory usage of loaded models.
-        
+
         Returns:
             Dictionary with memory estimates in GB
         """
+
         def count_params(model):
             total_params = 0
             for _, v in tree_flatten(model.parameters()):
@@ -353,14 +359,14 @@ class ModelManager:
                     else:
                         total_params += v.size
             return total_params
-        
+
         target_params = count_params(self.target_model) if self.target_model else 0
         draft_params = count_params(self.draft_model) if self.draft_model else 0
-        
+
         # Rough estimates: 4-bit = 0.5 bytes, FP16 = 2 bytes per param
         target_memory = target_params * 0.5 / (1024**3)  # 4-bit quantized
-        draft_memory = draft_params * 2 / (1024**3)      # FP16
-        
+        draft_memory = draft_params * 2 / (1024**3)  # FP16
+
         return {
             "target_model_gb": target_memory,
             "draft_model_gb": draft_memory,
@@ -377,52 +383,52 @@ def sample_token(
 ) -> mx.array:
     """
     Sample a token from logits using temperature and top-p sampling.
-    
+
     Args:
         logits: Model output logits [vocab_size] or [1, vocab_size]
         temperature: Sampling temperature (0 = greedy)
         top_p: Nucleus sampling threshold
-        
+
     Returns:
         Sampled token ID
     """
     # Handle batch dimension
     if logits.ndim == 2:
         logits = logits[0]
-    
+
     # Greedy sampling
     if temperature == 0:
         return mx.argmax(logits)
-    
+
     # Apply temperature
     logits = logits / temperature
-    
+
     # Top-p (nucleus) sampling
     if top_p < 1.0:
         # Sort logits in descending order
         sorted_indices = mx.argsort(-logits)
         sorted_logits = logits[sorted_indices]
-        
+
         # Compute cumulative probabilities
         probs = mx.softmax(sorted_logits)
         cumsum_probs = mx.cumsum(probs)
-        
+
         # Find cutoff index
         cutoff_mask = cumsum_probs <= top_p
         # Always include at least one token
         cutoff_mask = mx.concatenate([mx.array([True]), cutoff_mask[:-1]])
-        
+
         # Zero out tokens beyond cutoff
-        sorted_logits = mx.where(cutoff_mask, sorted_logits, mx.array(float('-inf')))
-        
+        sorted_logits = mx.where(cutoff_mask, sorted_logits, mx.array(float("-inf")))
+
         # Restore original order
         logits = mx.zeros_like(logits)
         logits[sorted_indices] = sorted_logits
-    
+
     # Sample from distribution
     probs = mx.softmax(logits)
     token = mx.random.categorical(logits)
-    
+
     return token
 
 
@@ -433,30 +439,31 @@ def get_logits(
 ) -> Tuple[mx.array, Optional[Any]]:
     """
     Get logits from a model for the given input.
-    
+
     Args:
         model: The language model
         input_ids: Input token IDs [seq_len] or [batch, seq_len]
         cache: Optional KV cache for efficient generation
-        
+
     Returns:
         Tuple of (logits, updated_cache)
     """
     # Ensure proper shape [batch, seq_len]
     if input_ids.ndim == 1:
         input_ids = input_ids[None, :]
-    
+
     if cache is not None:
         logits = model(input_ids, cache=cache)
     else:
         logits = model(input_ids)
-    
+
     return logits, cache
 
 
 # ============================================================================
 # KV Cache Management Helpers for Manual Speculative Decoding
 # ============================================================================
+
 
 def create_kv_cache(model: nn.Module) -> Any:
     """
@@ -475,21 +482,23 @@ def create_kv_cache(model: nn.Module) -> Any:
     # Try MLX-LM's make_prompt_cache first (works with mlx_lm.load models)
     try:
         from mlx_lm.models.cache import make_prompt_cache
+
         return make_prompt_cache(model)
     except ImportError:
         pass
 
     # MLX models may have their own make_cache method
-    if hasattr(model, 'make_cache'):
+    if hasattr(model, "make_cache"):
         return model.make_cache()
 
     # Fallback: create cache manually based on model structure
     # Most transformer models have a layers attribute
-    if hasattr(model, 'layers'):
+    if hasattr(model, "layers"):
         num_layers = len(model.layers)
         # Return list of empty KVCache objects
         try:
             from mlx_lm.models.cache import KVCache
+
             return [KVCache() for _ in range(num_layers)]
         except ImportError:
             # Last resort - return list of None (will be populated during forward pass)
@@ -507,16 +516,16 @@ def get_logits_with_cache(
 ) -> Tuple[mx.array, Any]:
     """
     Forward pass that returns logits and updates the KV cache.
-    
+
     This function handles the model forward pass with proper cache management.
     It's designed for use in autoregressive generation where we want to
     maintain and update the KV cache across generation steps.
-    
+
     Args:
         model: The language model
         tokens: Input token IDs [seq_len] or [batch, seq_len]
         cache: Optional existing KV cache to use and update
-        
+
     Returns:
         Tuple of (logits, updated_cache)
         - logits: Shape [batch, seq_len, vocab_size]
@@ -525,42 +534,42 @@ def get_logits_with_cache(
     # Ensure proper shape [batch, seq_len]
     if tokens.ndim == 1:
         tokens = tokens[None, :]
-    
+
     if cache is not None:
         # Forward pass with cache - cache is updated in-place for most MLX models
         logits = model(tokens, cache=cache)
     else:
         # First pass without cache - model may return cache
         logits = model(tokens)
-    
+
     return logits, cache
 
 
 def rewind_cache(cache: Any, position: int) -> Any:
     """
     Truncate the KV cache to the specified position.
-    
+
     When speculative decoding rejects a draft token, we need to "rewind"
     the cache to the point of rejection, discarding cached values for
     rejected tokens.
-    
+
     Args:
         cache: The KV cache to truncate
         position: Position to truncate to (exclusive, keeps 0 to position-1)
-        
+
     Returns:
         Truncated cache (may be same object if modified in-place)
     """
     if cache is None:
         return None
-    
+
     # Handle list of layer caches (most common format)
     if isinstance(cache, list):
         for i, layer_cache in enumerate(cache):
             if layer_cache is not None:
                 cache[i] = _rewind_layer_cache(layer_cache, position)
         return cache
-    
+
     # Handle single cache object (for simpler models)
     return _rewind_layer_cache(cache, position)
 
@@ -568,17 +577,17 @@ def rewind_cache(cache: Any, position: int) -> Any:
 def _rewind_layer_cache(layer_cache: Any, position: int) -> Any:
     """
     Rewind a single layer's KV cache to the specified position.
-    
+
     Args:
         layer_cache: Cache for one transformer layer (typically tuple of K, V)
         position: Position to truncate to
-        
+
     Returns:
         Truncated layer cache
     """
     if layer_cache is None:
         return None
-    
+
     # Handle tuple of (keys, values) - most common format
     if isinstance(layer_cache, tuple) and len(layer_cache) == 2:
         keys, values = layer_cache
@@ -602,10 +611,10 @@ def _rewind_layer_cache(layer_cache: Any, position: int) -> Any:
     # Handle MLX-LM's KVCache object which has update/rewind methods
     # IMPORTANT: Check this BEFORE checking for keys/values alone, since MLX-LM's
     # KVCache objects have all three attributes (keys, values, AND offset)
-    if hasattr(layer_cache, 'offset'):
+    if hasattr(layer_cache, "offset"):
         # MLX-LM uses offset tracking, adjust it
         layer_cache.offset = position
-        if hasattr(layer_cache, 'keys') and layer_cache.keys is not None:
+        if hasattr(layer_cache, "keys") and layer_cache.keys is not None:
             if layer_cache.keys.ndim == 4:
                 layer_cache.keys = layer_cache.keys[:, :, :position, :]
                 layer_cache.values = layer_cache.values[:, :, :position, :]
@@ -615,7 +624,7 @@ def _rewind_layer_cache(layer_cache: Any, position: int) -> Any:
         return layer_cache
 
     # Handle object with keys/values attributes (but no offset)
-    if hasattr(layer_cache, 'keys') and hasattr(layer_cache, 'values'):
+    if hasattr(layer_cache, "keys") and hasattr(layer_cache, "values"):
         if layer_cache.keys is not None:
             if layer_cache.keys.ndim == 4:
                 layer_cache.keys = layer_cache.keys[:, :, :position, :]
@@ -630,16 +639,16 @@ def _rewind_layer_cache(layer_cache: Any, position: int) -> Any:
 def get_cache_length(cache: Any) -> int:
     """
     Get the current sequence length stored in the cache.
-    
+
     Args:
         cache: The KV cache
-        
+
     Returns:
         Number of positions currently cached
     """
     if cache is None:
         return 0
-    
+
     # Handle list of layer caches
     if isinstance(cache, list):
         for layer_cache in cache:
@@ -648,7 +657,7 @@ def get_cache_length(cache: Any) -> int:
                 if length > 0:
                     return length
         return 0
-    
+
     return _get_layer_cache_length(cache)
 
 
@@ -660,7 +669,7 @@ def _get_layer_cache_length(layer_cache: Any) -> int:
     # PRIORITY 1: Handle MLX-LM's KVCache with offset tracking
     # This MUST be checked first because KVCache pre-allocates keys/values
     # to a larger size (e.g., 256), but offset tracks actual content length
-    if hasattr(layer_cache, 'offset'):
+    if hasattr(layer_cache, "offset"):
         return layer_cache.offset
 
     # PRIORITY 2: Handle tuple of (keys, values)
@@ -673,10 +682,10 @@ def _get_layer_cache_length(layer_cache: Any) -> int:
                 return keys.shape[1]  # [batch, seq, hidden]
 
     # PRIORITY 3: Handle object with keys attribute but no offset
-    if hasattr(layer_cache, 'keys') and layer_cache.keys is not None:
+    if hasattr(layer_cache, "keys") and layer_cache.keys is not None:
         if layer_cache.keys.ndim == 4:
             return layer_cache.keys.shape[2]
         elif layer_cache.keys.ndim == 3:
             return layer_cache.keys.shape[1]
-    
+
     return 0

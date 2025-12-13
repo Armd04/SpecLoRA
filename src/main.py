@@ -21,10 +21,15 @@ from typing import Optional, List, Dict, Any
 import click
 import yaml
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    BarColumn,
+    TaskProgressColumn,
+)
 from rich.table import Table
 from rich.panel import Panel
-from rich import print as rprint
 
 # Configure logging
 logging.basicConfig(
@@ -42,7 +47,7 @@ def load_config(config_path: str = "configs/config.yaml") -> Dict[str, Any]:
     if not config_path.exists():
         console.print(f"[red]Config file not found: {config_path}[/red]")
         sys.exit(1)
-    
+
     with open(config_path) as f:
         return yaml.safe_load(f)
 
@@ -50,14 +55,14 @@ def load_config(config_path: str = "configs/config.yaml") -> Dict[str, Any]:
 class SpeculativeDecodingSystem:
     """
     Main orchestration class for the speculative decoding system.
-    
+
     Coordinates between:
     - Model loading and management
     - Speculative decoding inference
     - Failure case collection
     - LoRA training
     """
-    
+
     def __init__(self, config: Dict[str, Any]):
         """
         Initialize the system with configuration.
@@ -72,15 +77,15 @@ class SpeculativeDecodingSystem:
         self.rate_tracker = None
         self._initialized = False
         self._generation_count = 0  # Track generations for cache clearing
-    
+
     def initialize(self) -> None:
         """Initialize all components."""
         from .models import ModelManager
         from .speculative import SpeculativeDecoder
         from .data_collector import DataCollector, AcceptanceRateTracker
-        
+
         console.print("[cyan]Initializing speculative decoding system...[/cyan]")
-        
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -88,19 +93,19 @@ class SpeculativeDecodingSystem:
         ) as progress:
             # Load models
             task = progress.add_task("Loading models...", total=None)
-            
+
             self.model_manager = ModelManager(
                 target_model_name=self.config["models"]["target"]["name"],
                 draft_model_name=self.config["models"]["draft"]["name"],
             )
             self.model_manager.load_models()
-            
+
             progress.update(task, description="Models loaded!")
-            
+
             # Get models and tokenizer
             target_model, target_tokenizer = self.model_manager.get_target_model()
             draft_model, draft_tokenizer = self.model_manager.get_draft_model()
-            
+
             # Initialize decoder
             chat_config = self.config.get("chat", {})
             self.decoder = SpeculativeDecoder(
@@ -113,7 +118,7 @@ class SpeculativeDecodingSystem:
                 acceptance_threshold=self.config["speculative"]["acceptance_threshold"],
                 system_message=chat_config.get("system_message"),
             )
-            
+
             # Initialize data collector
             self.data_collector = DataCollector(
                 failures_dir=self.config["data"]["failures_dir"],
@@ -121,26 +126,30 @@ class SpeculativeDecodingSystem:
                 replay_buffer_size=self.config["training"]["replay_buffer_size"],
                 replay_ratio=self.config["training"]["replay_ratio"],
             )
-            
+
             # Initialize rate tracker
             self.rate_tracker = AcceptanceRateTracker()
-            
+
             # Try to load existing tracker data
-            tracker_path = Path(self.config["data"]["failures_dir"]) / "rate_tracker.json"
+            tracker_path = (
+                Path(self.config["data"]["failures_dir"]) / "rate_tracker.json"
+            )
             if tracker_path.exists():
                 self.rate_tracker.load(str(tracker_path))
-            
+
             self._initialized = True
-        
+
         # Print memory usage
         memory = self.model_manager.estimate_memory_usage()
-        console.print(Panel(
-            f"Target Model: {memory['target_params_m']:.1f}M params ({memory['target_model_gb']:.2f} GB)\n"
-            f"Draft Model: {memory['draft_params_m']:.1f}M params ({memory['draft_model_gb']:.2f} GB)\n"
-            f"Total: {memory['total_gb']:.2f} GB",
-            title="Memory Usage",
-        ))
-    
+        console.print(
+            Panel(
+                f"Target Model: {memory['target_params_m']:.1f}M params ({memory['target_model_gb']:.2f} GB)\n"
+                f"Draft Model: {memory['draft_params_m']:.1f}M params ({memory['draft_model_gb']:.2f} GB)\n"
+                f"Total: {memory['total_gb']:.2f} GB",
+                title="Memory Usage",
+            )
+        )
+
     def generate(
         self,
         prompt: str,
@@ -168,8 +177,13 @@ class SpeculativeDecodingSystem:
         max_tokens = max_tokens or self.config["speculative"]["max_tokens"]
 
         # Clear cache periodically to prevent memory accumulation
-        cache_clear_freq = self.config.get("memory", {}).get("cache_clear_frequency", 10)
-        if self._generation_count > 0 and self._generation_count % cache_clear_freq == 0:
+        cache_clear_freq = self.config.get("memory", {}).get(
+            "cache_clear_frequency", 10
+        )
+        if (
+            self._generation_count > 0
+            and self._generation_count % cache_clear_freq == 0
+        ):
             self.model_manager.clear_cache()
             logger.debug(f"Cleared cache after {self._generation_count} generations")
 
@@ -179,13 +193,13 @@ class SpeculativeDecodingSystem:
                 prompt=prompt,
                 max_tokens=max_tokens,
             )
-            
+
             # Increment generation counter
             self._generation_count += 1
-            
+
             # Track acceptance rate
             self.rate_tracker.add_rate(result.metrics.acceptance_rate)
-            
+
             # Collect detailed data if enabled
             if collect_data:
                 # Calculate prompt length for accurate disagreement position mapping
@@ -212,32 +226,50 @@ class SpeculativeDecodingSystem:
                     },
                     prompt_length=prompt_length,
                 )
-                
+
                 if should_train:
                     console.print(
                         "[yellow]Training threshold reached! "
                         "Run 'train' command to fine-tune the draft model.[/yellow]"
                     )
-            
+
             # Display detailed metrics
-            metrics_table = Table(title="Generation Metrics (Manual Spec-Dec)", show_header=False)
-            metrics_table.add_row("Acceptance Rate", f"{result.metrics.acceptance_rate:.1%}")
-            metrics_table.add_row("Tokens/Second", f"{result.metrics.tokens_per_second:.1f}")
-            metrics_table.add_row("Total Tokens", str(result.metrics.total_tokens_generated))
-            metrics_table.add_row("Draft Proposed", str(result.metrics.draft_tokens_proposed))
-            metrics_table.add_row("Draft Accepted", str(result.metrics.draft_tokens_accepted))
-            metrics_table.add_row("[bold]Disagreements[/bold]", str(len(result.disagreements)))
-            metrics_table.add_row("Is Failure Case", "Yes" if result.is_failure_case else "No")
-            
+            metrics_table = Table(
+                title="Generation Metrics (Manual Spec-Dec)", show_header=False
+            )
+            metrics_table.add_row(
+                "Acceptance Rate", f"{result.metrics.acceptance_rate:.1%}"
+            )
+            metrics_table.add_row(
+                "Tokens/Second", f"{result.metrics.tokens_per_second:.1f}"
+            )
+            metrics_table.add_row(
+                "Total Tokens", str(result.metrics.total_tokens_generated)
+            )
+            metrics_table.add_row(
+                "Draft Proposed", str(result.metrics.draft_tokens_proposed)
+            )
+            metrics_table.add_row(
+                "Draft Accepted", str(result.metrics.draft_tokens_accepted)
+            )
+            metrics_table.add_row(
+                "[bold]Disagreements[/bold]", str(len(result.disagreements))
+            )
+            metrics_table.add_row(
+                "Is Failure Case", "Yes" if result.is_failure_case else "No"
+            )
+
             # Show disagreement details if any
             if result.disagreements:
-                high_conf = sum(1 for d in result.disagreements if d.is_high_confidence_failure)
+                high_conf = sum(
+                    1 for d in result.disagreements if d.is_high_confidence_failure
+                )
                 metrics_table.add_row("High-Confidence Failures", str(high_conf))
-            
+
             console.print(metrics_table)
-            
+
             return result.text
-        
+
         else:
             # Use MLX-LM's built-in speculative decoding
             result = self.decoder.generate(
@@ -263,18 +295,32 @@ class SpeculativeDecodingSystem:
                     )
 
             # Display metrics
-            metrics_table = Table(title="Generation Metrics (MLX-LM Built-in)", show_header=False)
-            metrics_table.add_row("Acceptance Rate", f"{result.metrics.acceptance_rate:.1%}")
-            metrics_table.add_row("Tokens/Second", f"{result.metrics.tokens_per_second:.1f}")
-            metrics_table.add_row("Total Tokens", str(result.metrics.total_tokens_generated))
-            metrics_table.add_row("Draft Proposed", str(result.metrics.draft_tokens_proposed))
-            metrics_table.add_row("Draft Accepted", str(result.metrics.draft_tokens_accepted))
-            metrics_table.add_row("Is Failure Case", "Yes" if result.is_failure_case else "No")
-            
+            metrics_table = Table(
+                title="Generation Metrics (MLX-LM Built-in)", show_header=False
+            )
+            metrics_table.add_row(
+                "Acceptance Rate", f"{result.metrics.acceptance_rate:.1%}"
+            )
+            metrics_table.add_row(
+                "Tokens/Second", f"{result.metrics.tokens_per_second:.1f}"
+            )
+            metrics_table.add_row(
+                "Total Tokens", str(result.metrics.total_tokens_generated)
+            )
+            metrics_table.add_row(
+                "Draft Proposed", str(result.metrics.draft_tokens_proposed)
+            )
+            metrics_table.add_row(
+                "Draft Accepted", str(result.metrics.draft_tokens_accepted)
+            )
+            metrics_table.add_row(
+                "Is Failure Case", "Yes" if result.is_failure_case else "No"
+            )
+
             console.print(metrics_table)
-            
+
             return result.text
-    
+
     def collect_data_batch(
         self,
         prompts: List[str],
@@ -283,30 +329,28 @@ class SpeculativeDecodingSystem:
     ) -> Dict[str, Any]:
         """
         Run data collection on a batch of prompts using manual speculative decoding.
-        
+
         This method processes multiple prompts and collects detailed token-level
         disagreement data for training.
-        
+
         Args:
             prompts: List of prompts to process
             max_tokens: Maximum tokens per generation
             output_file: Optional path to save detailed results
-            
+
         Returns:
             Dictionary with aggregate statistics
         """
         if not self._initialized:
             self.initialize()
-        
-        from .speculative_manual import run_data_collection_batch
-        
+
         max_tokens = max_tokens or self.config["speculative"]["max_tokens"]
-        
+
         # Create manual decoder
         manual_decoder = self.decoder.create_manual_decoder()
-        
+
         console.print(f"[cyan]Collecting data from {len(prompts)} prompts...[/cyan]")
-        
+
         # Run batch collection with progress
         results = []
         stats = {
@@ -315,7 +359,7 @@ class SpeculativeDecodingSystem:
             "total_accepted": 0,
             "total_proposed": 0,
         }
-        
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -324,7 +368,7 @@ class SpeculativeDecodingSystem:
             console=console,
         ) as progress:
             task = progress.add_task("Processing prompts...", total=len(prompts))
-            
+
             for prompt in prompts:
                 result = manual_decoder.generate_with_data_collection(
                     prompt, max_tokens
@@ -348,69 +392,74 @@ class SpeculativeDecodingSystem:
                     acceptance_rate=result.metrics.acceptance_rate,
                     prompt_length=prompt_length,
                 )
-                
+
                 # Track aggregate stats
                 stats["total_tokens"] += result.metrics.total_tokens_generated
                 stats["total_disagreements"] += len(result.disagreements)
                 stats["total_accepted"] += result.metrics.draft_tokens_accepted
                 stats["total_proposed"] += result.metrics.draft_tokens_proposed
-                
+
                 # Track rate
                 self.rate_tracker.add_rate(result.metrics.acceptance_rate)
-                
+
                 progress.advance(task)
-        
+
         # Calculate final stats
         stats["num_prompts"] = len(prompts)
-        stats["acceptance_rate"] = (
-            stats["total_accepted"] / max(stats["total_proposed"], 1)
+        stats["acceptance_rate"] = stats["total_accepted"] / max(
+            stats["total_proposed"], 1
         )
         stats["avg_disagreements"] = stats["total_disagreements"] / max(len(prompts), 1)
         stats["failure_cases"] = sum(1 for r in results if r.is_failure_case)
         stats["high_confidence_failures"] = sum(
-            1 for r in results
-            for d in r.disagreements
-            if d.is_high_confidence_failure
+            1 for r in results for d in r.disagreements if d.is_high_confidence_failure
         )
-        
+
         # Save detailed results if output file specified
         if output_file:
             import json
+
             output_path = Path(output_file)
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            
+
             detailed_results = []
             for r in results:
-                detailed_results.append({
-                    "prompt": r.prompt,
-                    "text": r.text,
-                    "tokens": r.tokens,
-                    "acceptance_rate": r.metrics.acceptance_rate,
-                    "disagreements": [d.to_dict() for d in r.disagreements],
-                    "is_failure": r.is_failure_case,
-                })
-            
+                detailed_results.append(
+                    {
+                        "prompt": r.prompt,
+                        "text": r.text,
+                        "tokens": r.tokens,
+                        "acceptance_rate": r.metrics.acceptance_rate,
+                        "disagreements": [d.to_dict() for d in r.disagreements],
+                        "is_failure": r.is_failure_case,
+                    }
+                )
+
             with open(output_path, "w") as f:
                 for item in detailed_results:
                     f.write(json.dumps(item) + "\n")
-            
+
             console.print(f"[green]Saved detailed results to {output_file}[/green]")
-        
+
         # Display summary
         table = Table(title="Data Collection Summary")
         table.add_column("Metric")
         table.add_column("Value")
-        
+
         table.add_row("Prompts Processed", str(stats["num_prompts"]))
         table.add_row("Total Tokens", str(stats["total_tokens"]))
         table.add_row("Acceptance Rate", f"{stats['acceptance_rate']:.1%}")
-        table.add_row("[bold]Total Disagreements[/bold]", str(stats["total_disagreements"]))
+        table.add_row(
+            "[bold]Total Disagreements[/bold]", str(stats["total_disagreements"])
+        )
         table.add_row("Avg Disagreements/Prompt", f"{stats['avg_disagreements']:.1f}")
         table.add_row("Failure Cases", str(stats["failure_cases"]))
-        table.add_row("High-Confidence Failures", str(stats["high_confidence_failures"]))
-        
+        table.add_row(
+            "High-Confidence Failures", str(stats["high_confidence_failures"])
+        )
+
         console.print(table)
-        
+
         # Check if training should be triggered
         collector_stats = self.data_collector.get_stats()
         if collector_stats["ready_for_training"]:
@@ -418,23 +467,23 @@ class SpeculativeDecodingSystem:
                 "[yellow]Training threshold reached! "
                 "Run 'train' command to fine-tune the draft model.[/yellow]"
             )
-        
+
         return stats
-    
+
     def train(self, num_epochs: Optional[int] = None) -> None:
         """
         Train the draft model on collected failure cases.
-        
+
         Args:
             num_epochs: Number of training epochs
         """
         if not self._initialized:
             self.initialize()
-        
+
         from .training import LoRATrainer, LoRAConfig
-        
+
         num_epochs = num_epochs or self.config["training"]["num_epochs"]
-        
+
         # Check if we have enough data
         stats = self.data_collector.get_stats()
         if stats["num_failure_cases"] < self.config["training"]["min_failure_cases"]:
@@ -443,17 +492,19 @@ class SpeculativeDecodingSystem:
                 f"Have {stats['num_failure_cases']}, need {self.config['training']['min_failure_cases']}[/yellow]"
             )
             return
-        
-        console.print(Panel(
-            f"Failure cases: {stats['num_failure_cases']}\n"
-            f"Replay buffer: {stats['num_replay_cases']}\n"
-            f"Avg failure acceptance: {stats.get('avg_failure_acceptance', 0):.1%}",
-            title="Training Data Summary",
-        ))
-        
+
+        console.print(
+            Panel(
+                f"Failure cases: {stats['num_failure_cases']}\n"
+                f"Replay buffer: {stats['num_replay_cases']}\n"
+                f"Avg failure acceptance: {stats.get('avg_failure_acceptance', 0):.1%}",
+                title="Training Data Summary",
+            )
+        )
+
         # Get training data
         training_examples = self.data_collector.get_all_training_data()
-        
+
         # Setup LoRA config
         lora_config = LoRAConfig(
             rank=self.config["training"]["lora"]["rank"],
@@ -461,10 +512,10 @@ class SpeculativeDecodingSystem:
             dropout=self.config["training"]["lora"]["dropout"],
             target_modules=self.config["training"]["lora"]["target_modules"],
         )
-        
+
         # Get draft model
         draft_model, tokenizer = self.model_manager.get_draft_model()
-        
+
         # Initialize trainer
         trainer = LoRATrainer(
             model=draft_model,
@@ -472,13 +523,15 @@ class SpeculativeDecodingSystem:
             lora_config=lora_config,
             learning_rate=self.config["training"]["learning_rate"],
             batch_size=self.config["training"]["batch_size"],
-            gradient_accumulation_steps=self.config["training"]["gradient_accumulation_steps"],
+            gradient_accumulation_steps=self.config["training"][
+                "gradient_accumulation_steps"
+            ],
             warmup_steps=self.config["training"]["warmup_steps"],
             checkpoint_dir=self.config["training"]["checkpoint_dir"],
         )
-        
+
         console.print("[cyan]Starting LoRA training...[/cyan]")
-        
+
         # Train
         metrics = trainer.train(
             training_examples=training_examples,
@@ -495,48 +548,48 @@ class SpeculativeDecodingSystem:
 
         # Clear failure cases
         self.data_collector.clear_failure_cases()
-        
+
         # Display results
         results_table = Table(title="Training Results", show_header=False)
         results_table.add_row("Total Steps", str(metrics.total_steps))
         results_table.add_row("Average Loss", f"{metrics.avg_loss:.4f}")
         results_table.add_row("Training Time", f"{metrics.training_time_seconds:.1f}s")
-        
+
         console.print(results_table)
         console.print("[green]Training complete! Draft model updated.[/green]")
-    
+
     def evaluate(self, prompts: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Evaluate current acceptance rates.
-        
+
         Args:
             prompts: Optional list of evaluation prompts
-            
+
         Returns:
             Evaluation results
         """
         if not self._initialized:
             self.initialize()
-        
+
         from .speculative import run_acceptance_benchmark
-        
+
         prompts = prompts or self.config["evaluation"]["test_prompts"]
-        
+
         console.print("[cyan]Running evaluation benchmark...[/cyan]")
-        
+
         results = run_acceptance_benchmark(
             decoder=self.decoder,
             prompts=prompts,
             max_tokens=128,
         )
-        
+
         # Display results
         table = Table(title="Evaluation Results")
         table.add_column("Prompt")
         table.add_column("Acceptance Rate")
         table.add_column("Tokens/s")
         table.add_column("Failure?")
-        
+
         for prompt_result in results["per_prompt"]:
             table.add_row(
                 prompt_result["prompt"],
@@ -544,32 +597,36 @@ class SpeculativeDecodingSystem:
                 f"{prompt_result['tokens_per_second']:.1f}",
                 "Yes" if prompt_result["is_failure"] else "No",
             )
-        
+
         console.print(table)
-        
+
         # Summary
-        console.print(Panel(
-            f"Overall Acceptance Rate: {results['overall_acceptance_rate']:.1%}\n"
-            f"Overall Tokens/Second: {results['overall_tokens_per_second']:.1f}",
-            title="Summary",
-        ))
-        
+        console.print(
+            Panel(
+                f"Overall Acceptance Rate: {results['overall_acceptance_rate']:.1%}\n"
+                f"Overall Tokens/Second: {results['overall_tokens_per_second']:.1f}",
+                title="Summary",
+            )
+        )
+
         return results
-    
+
     def get_stats(self) -> Dict[str, Any]:
         """Get current system statistics."""
         if not self._initialized:
-            console.print("[yellow]System not initialized. Run a command first.[/yellow]")
+            console.print(
+                "[yellow]System not initialized. Run a command first.[/yellow]"
+            )
             return {}
-        
+
         collector_stats = self.data_collector.get_stats()
         tracker_stats = self.rate_tracker.get_stats()
-        
+
         return {
             "collector": collector_stats,
             "tracker": tracker_stats,
         }
-    
+
     def interactive_mode(self, implementation: str = "manual") -> None:
         """Run interactive generation mode.
 
@@ -579,17 +636,21 @@ class SpeculativeDecodingSystem:
         if not self._initialized:
             self.initialize()
 
-        impl_desc = "Manual Spec-Dec" if implementation == "manual" else "MLX-LM Built-in"
-        console.print(Panel(
-            f"Implementation: [cyan]{impl_desc}[/cyan]\n\n"
-            "Enter prompts to generate text. Commands:\n"
-            "  /quit - Exit interactive mode\n"
-            "  /stats - Show statistics\n"
-            "  /train - Train on collected data\n"
-            "  /eval - Run evaluation\n"
-            "  /clear - Clear screen",
-            title="Interactive Mode",
-        ))
+        impl_desc = (
+            "Manual Spec-Dec" if implementation == "manual" else "MLX-LM Built-in"
+        )
+        console.print(
+            Panel(
+                f"Implementation: [cyan]{impl_desc}[/cyan]\n\n"
+                "Enter prompts to generate text. Commands:\n"
+                "  /quit - Exit interactive mode\n"
+                "  /stats - Show statistics\n"
+                "  /train - Train on collected data\n"
+                "  /eval - Run evaluation\n"
+                "  /clear - Clear screen",
+                title="Interactive Mode",
+            )
+        )
 
         while True:
             try:
@@ -648,12 +709,13 @@ def cli(ctx, config):
 @click.option("--max-tokens", "-m", default=256, help="Maximum tokens to generate")
 @click.option("--no-collect", is_flag=True, help="Disable data collection")
 @click.option(
-    "--implementation", "-i",
+    "--implementation",
+    "-i",
     type=click.Choice(["manual", "builtin"]),
     default="manual",
     help="Speculative decoding implementation: 'manual' (default) uses our implementation "
-         "with KV-cached target verification and token-level data collection, "
-         "'builtin' uses MLX-LM's built-in speculative decoding"
+    "with KV-cached target verification and token-level data collection, "
+    "'builtin' uses MLX-LM's built-in speculative decoding",
 )
 @click.pass_context
 def generate(ctx, prompt, max_tokens, no_collect, implementation):
@@ -675,7 +737,9 @@ def generate(ctx, prompt, max_tokens, no_collect, implementation):
 
 
 @cli.command()
-@click.option("--epochs", "-e", default=None, type=int, help="Number of training epochs")
+@click.option(
+    "--epochs", "-e", default=None, type=int, help="Number of training epochs"
+)
 @click.pass_context
 def train(ctx, epochs):
     """Train the draft model on collected failure cases."""
@@ -698,7 +762,7 @@ def stats(ctx):
     system = SpeculativeDecodingSystem(ctx.obj["config"])
     system.initialize()
     stats = system.get_stats()
-    
+
     # Collector stats
     if "collector" in stats:
         table = Table(title="Data Collector Stats")
@@ -710,7 +774,7 @@ def stats(ctx):
             else:
                 table.add_row(key, str(value))
         console.print(table)
-    
+
     # Tracker stats
     if "tracker" in stats:
         table = Table(title="Acceptance Rate Tracker")
@@ -727,10 +791,11 @@ def stats(ctx):
 
 @cli.command()
 @click.option(
-    "--implementation", "-i",
+    "--implementation",
+    "-i",
     type=click.Choice(["manual", "builtin"]),
     default="manual",
-    help="Speculative decoding implementation: 'manual' (default) or 'builtin'"
+    help="Speculative decoding implementation: 'manual' (default) or 'builtin'",
 )
 @click.pass_context
 def interactive(ctx, implementation):
@@ -748,10 +813,11 @@ def interactive(ctx, implementation):
 @click.option("--iterations", "-n", default=5, help="Number of iterations")
 @click.option("--max-tokens", "-m", default=128, help="Maximum tokens to generate")
 @click.option(
-    "--implementation", "-i",
+    "--implementation",
+    "-i",
     type=click.Choice(["manual", "builtin"]),
     default="manual",
-    help="Speculative decoding implementation to benchmark: 'manual' (default) or 'builtin'"
+    help="Speculative decoding implementation to benchmark: 'manual' (default) or 'builtin'",
 )
 @click.pass_context
 def benchmark(ctx, prompt, iterations, max_tokens, implementation):
@@ -794,7 +860,9 @@ def benchmark(ctx, prompt, iterations, max_tokens, implementation):
             spec_tokens.append(result.metrics.total_tokens_generated)
             spec_acceptance_rates.append(result.metrics.acceptance_rate)
         else:
-            result = system.decoder.generate(prompt, max_tokens=max_tokens, collect_training_data=False)
+            result = system.decoder.generate(
+                prompt, max_tokens=max_tokens, collect_training_data=False
+            )
             elapsed = time.time() - start
             spec_tokens.append(result.metrics.total_tokens_generated)
             spec_acceptance_rates.append(result.metrics.acceptance_rate)
@@ -807,7 +875,9 @@ def benchmark(ctx, prompt, iterations, max_tokens, implementation):
 
     for _ in range(iterations):
         start = time.time()
-        text, elapsed = system.decoder.generate_standard(prompt, max_tokens=max_tokens, use_target=True)
+        text, elapsed = system.decoder.generate_standard(
+            prompt, max_tokens=max_tokens, use_target=True
+        )
         std_times.append(elapsed)
         # Count only generated tokens (total - prompt)
         total_tokens = len(system.decoder.tokenizer.encode(text))
@@ -831,13 +901,13 @@ def benchmark(ctx, prompt, iterations, max_tokens, implementation):
         impl_name,
         f"{avg_spec_time:.2f}",
         f"{avg_spec_tokens:.0f}",
-        f"{avg_spec_tokens/avg_spec_time:.1f}",
+        f"{avg_spec_tokens / avg_spec_time:.1f}",
     )
     table.add_row(
         "Standard (Target)",
         f"{avg_std_time:.2f}",
         f"{avg_std_tokens:.0f}",
-        f"{avg_std_tokens/avg_std_time:.1f}",
+        f"{avg_std_tokens / avg_std_time:.1f}",
     )
 
     console.print(table)
@@ -857,68 +927,75 @@ def benchmark(ctx, prompt, iterations, max_tokens, implementation):
 
 @cli.command("collect-data")
 @click.option(
-    "--prompts-file", "-f",
+    "--prompts-file",
+    "-f",
     type=click.Path(exists=True),
-    help="File containing prompts (one per line)"
+    help="File containing prompts (one per line)",
 )
 @click.option(
-    "--prompts", "-p",
+    "--prompts",
+    "-p",
     multiple=True,
-    help="Prompts to process (can specify multiple times)"
+    help="Prompts to process (can specify multiple times)",
 )
 @click.option("--max-tokens", "-m", default=256, help="Maximum tokens per generation")
 @click.option(
-    "--output", "-o",
+    "--output",
+    "-o",
     type=click.Path(),
-    help="Output file for detailed results (JSONL format)"
+    help="Output file for detailed results (JSONL format)",
 )
 @click.pass_context
 def collect_data(ctx, prompts_file, prompts, max_tokens, output):
     """Collect token-level training data using manual speculative decoding.
-    
+
     This command runs manual speculative decoding on a batch of prompts
     to collect detailed token-level disagreements between draft and target
     models. This data is more valuable for training than the overall
     acceptance rates collected in normal mode.
-    
+
     Examples:
         # From file
         python -m src.main collect-data -f prompts.txt
-        
+
         # From command line
         python -m src.main collect-data -p "What is Python?" -p "Explain ML"
-        
+
         # With output file
         python -m src.main collect-data -f prompts.txt -o data/detailed.jsonl
     """
     # Collect prompts from all sources
     all_prompts = list(prompts)
-    
+
     if prompts_file:
         with open(prompts_file, "r") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
                     all_prompts.append(line)
-    
+
     if not all_prompts:
-        console.print("[red]Error: No prompts provided. Use --prompts-file or --prompts[/red]")
+        console.print(
+            "[red]Error: No prompts provided. Use --prompts-file or --prompts[/red]"
+        )
         return
-    
-    console.print(Panel(
-        f"Running data collection on [bold]{len(all_prompts)}[/bold] prompts\n"
-        f"Mode: [cyan]detailed[/cyan] (manual speculative decoding)\n"
-        f"Max tokens: {max_tokens}",
-        title="Data Collection Mode",
-    ))
-    
+
+    console.print(
+        Panel(
+            f"Running data collection on [bold]{len(all_prompts)}[/bold] prompts\n"
+            f"Mode: [cyan]detailed[/cyan] (manual speculative decoding)\n"
+            f"Max tokens: {max_tokens}",
+            title="Data Collection Mode",
+        )
+    )
+
     system = SpeculativeDecodingSystem(ctx.obj["config"])
-    stats = system.collect_data_batch(
+    system.collect_data_batch(
         prompts=all_prompts,
         max_tokens=max_tokens,
         output_file=output,
     )
-    
+
     console.print("\n[green]Data collection complete![/green]")
 
 
@@ -926,42 +1003,46 @@ def collect_data(ctx, prompts_file, prompts, max_tokens, output):
 @click.pass_context
 def demo(ctx):
     """Run a quick demo of the system."""
-    console.print(Panel(
-        "[bold]Speculative Decoding with Adaptive LoRA Demo[/bold]\n\n"
-        "This demo will:\n"
-        "1. Load the target (Qwen2.5-7B-4bit) and draft (Qwen2.5-0.5B) models\n"
-        "2. Generate text using speculative decoding\n"
-        "3. Show acceptance rate metrics\n"
-        "4. Demonstrate failure case collection",
-        title="Welcome",
-    ))
-    
+    console.print(
+        Panel(
+            "[bold]Speculative Decoding with Adaptive LoRA Demo[/bold]\n\n"
+            "This demo will:\n"
+            "1. Load the target (Qwen2.5-7B-4bit) and draft (Qwen2.5-0.5B) models\n"
+            "2. Generate text using speculative decoding\n"
+            "3. Show acceptance rate metrics\n"
+            "4. Demonstrate failure case collection",
+            title="Welcome",
+        )
+    )
+
     system = SpeculativeDecodingSystem(ctx.obj["config"])
     system.initialize()
-    
+
     # Demo prompts
     demo_prompts = [
         "What is the capital of France?",
         "Write a short poem about coding.",
         "Explain machine learning in one sentence.",
     ]
-    
+
     console.print("\n[bold cyan]Running demo generations...[/bold cyan]\n")
-    
+
     for i, prompt in enumerate(demo_prompts, 1):
         console.print(f"\n[bold]Demo {i}/{len(demo_prompts)}[/bold]")
         console.print(f"[green]Prompt:[/green] {prompt}")
-        
+
         response = system.generate(prompt, max_tokens=64)
         console.print(f"[blue]Response:[/blue] {response}")
-    
+
     # Show stats
     console.print("\n[bold cyan]Current Statistics[/bold cyan]")
     stats = system.get_stats()
     console.print(stats)
-    
+
     console.print("\n[green]Demo complete![/green]")
-    console.print("Run [bold]'python -m src.main interactive'[/bold] for interactive mode.")
+    console.print(
+        "Run [bold]'python -m src.main interactive'[/bold] for interactive mode."
+    )
 
 
 def main():

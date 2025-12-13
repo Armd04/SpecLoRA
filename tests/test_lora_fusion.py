@@ -14,12 +14,13 @@ from pathlib import Path
 import pytest
 
 import sys
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from src.training import LoRALinear, LoRAConfig, LoRATrainer, apply_lora_to_model
+from src.training import LoRALinear, LoRAConfig, LoRATrainer
 
 
 class TestLoRALinear:
@@ -73,9 +74,6 @@ class TestLoRAFusion:
         original = nn.Linear(16, 32)
         mx.eval(original.parameters())
 
-        # Save original weight before wrapping
-        original_weight = original.weight
-
         # Wrap with LoRA and set non-zero B weights
         lora_layer = LoRALinear(original, rank=4, alpha=8)
         lora_layer.lora_B = mx.random.normal((32, 4)) * 0.1
@@ -95,7 +93,10 @@ class TestLoRAFusion:
         fused_weight = lora_layer.original_layer.weight + delta
 
         # Create fused layer (need to handle bias properly)
-        has_bias = hasattr(lora_layer.original_layer, 'bias') and lora_layer.original_layer.bias is not None
+        has_bias = (
+            hasattr(lora_layer.original_layer, "bias")
+            and lora_layer.original_layer.bias is not None
+        )
         fused_layer = nn.Linear(16, 32, bias=has_bias)
         fused_layer.weight = fused_weight
         if has_bias:
@@ -115,6 +116,7 @@ class TestCheckpointFormat:
 
     def test_checkpoint_has_adapter_config(self):
         """Test that saved checkpoints include adapter_config.json."""
+
         # Create a simple model
         class SimpleModel(nn.Module):
             def __init__(self):
@@ -131,13 +133,16 @@ class TestCheckpointFormat:
         # Mock tokenizer
         class MockTokenizer:
             pad_token_id = 0
+
             def encode(self, text):
                 return [1, 2, 3]
 
         tokenizer = MockTokenizer()
 
         # Create LoRA config and trainer
-        config = LoRAConfig(rank=4, alpha=8, dropout=0.0, target_modules=["q_proj", "v_proj"])
+        config = LoRAConfig(
+            rank=4, alpha=8, dropout=0.0, target_modules=["q_proj", "v_proj"]
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             trainer = LoRATrainer(
@@ -167,6 +172,7 @@ class TestCheckpointFormat:
 
     def test_checkpoint_uses_mlx_lm_naming(self):
         """Test that saved weights use MLX-LM naming convention (lora_a, lora_b)."""
+
         # Create a simple model
         class SimpleModel(nn.Module):
             def __init__(self):
@@ -182,6 +188,7 @@ class TestCheckpointFormat:
         # Mock tokenizer
         class MockTokenizer:
             pad_token_id = 0
+
             def encode(self, text):
                 return [1, 2, 3]
 
@@ -205,12 +212,20 @@ class TestCheckpointFormat:
 
             # Should have lowercase lora_a and lora_b (MLX-LM format)
             weight_names = list(weights.keys())
-            assert any("lora_a" in name for name in weight_names), f"Expected lora_a in {weight_names}"
-            assert any("lora_b" in name for name in weight_names), f"Expected lora_b in {weight_names}"
+            assert any("lora_a" in name for name in weight_names), (
+                f"Expected lora_a in {weight_names}"
+            )
+            assert any("lora_b" in name for name in weight_names), (
+                f"Expected lora_b in {weight_names}"
+            )
 
             # Should NOT have uppercase lora_A or lora_B
-            assert not any("lora_A" in name for name in weight_names), f"Found lora_A in {weight_names}"
-            assert not any("lora_B" in name for name in weight_names), f"Found lora_B in {weight_names}"
+            assert not any("lora_A" in name for name in weight_names), (
+                f"Found lora_A in {weight_names}"
+            )
+            assert not any("lora_B" in name for name in weight_names), (
+                f"Found lora_B in {weight_names}"
+            )
 
 
 class TestTrainerFusion:
@@ -218,6 +233,7 @@ class TestTrainerFusion:
 
     def test_fuse_and_get_model_returns_clean_model(self):
         """Test that fuse_and_get_model returns a model without LoRA wrappers."""
+
         # Create a simple model
         class SimpleModel(nn.Module):
             def __init__(self):
@@ -234,12 +250,15 @@ class TestTrainerFusion:
         # Mock tokenizer
         class MockTokenizer:
             pad_token_id = 0
+
             def encode(self, text):
                 return [1, 2, 3]
 
         tokenizer = MockTokenizer()
 
-        config = LoRAConfig(rank=4, alpha=8, dropout=0.0, target_modules=["q_proj", "v_proj"])
+        config = LoRAConfig(
+            rank=4, alpha=8, dropout=0.0, target_modules=["q_proj", "v_proj"]
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             trainer = LoRATrainer(
@@ -264,6 +283,7 @@ class TestTrainerFusion:
 
     def test_fused_model_produces_same_output(self):
         """Test that fused model produces same output as LoRA-wrapped model."""
+
         # Create a simple model
         class SimpleModel(nn.Module):
             def __init__(self):
@@ -280,12 +300,15 @@ class TestTrainerFusion:
         # Mock tokenizer
         class MockTokenizer:
             pad_token_id = 0
+
             def encode(self, text):
                 return [1, 2, 3]
 
         tokenizer = MockTokenizer()
 
-        config = LoRAConfig(rank=4, alpha=8, dropout=0.0, target_modules=["q_proj", "v_proj"])
+        config = LoRAConfig(
+            rank=4, alpha=8, dropout=0.0, target_modules=["q_proj", "v_proj"]
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             trainer = LoRATrainer(

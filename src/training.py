@@ -32,16 +32,16 @@ logger = logging.getLogger(__name__)
 @dataclass
 class LoRAConfig:
     """Configuration for LoRA adapters."""
-    
+
     rank: int = 8
     alpha: int = 16
     dropout: float = 0.05
     target_modules: List[str] = None
-    
+
     def __post_init__(self):
         if self.target_modules is None:
             self.target_modules = ["q_proj", "v_proj"]
-    
+
     @property
     def scaling(self) -> float:
         """LoRA scaling factor."""
@@ -51,14 +51,14 @@ class LoRAConfig:
 class LoRALinear(nn.Module):
     """
     LoRA adapter for linear layers.
-    
+
     LoRA decomposes weight updates into two low-rank matrices:
     W' = W + BA where B is (out_features, rank) and A is (rank, in_features)
-    
+
     This dramatically reduces trainable parameters while maintaining
     model capacity for specific tasks.
     """
-    
+
     def __init__(
         self,
         original_layer: nn.Linear,
@@ -68,7 +68,7 @@ class LoRALinear(nn.Module):
     ):
         """
         Initialize LoRA adapter.
-        
+
         Args:
             original_layer: The original linear layer to adapt
             rank: LoRA rank (lower = fewer params, less capacity)
@@ -76,37 +76,37 @@ class LoRALinear(nn.Module):
             dropout: Dropout rate for regularization
         """
         super().__init__()
-        
+
         self.original_layer = original_layer
         self.rank = rank
         self.alpha = alpha
         self.scaling = alpha / rank
-        
+
         in_features = original_layer.weight.shape[1]
         out_features = original_layer.weight.shape[0]
-        
+
         # LoRA matrices: A projects down, B projects up
         # Initialize A with small random values, B with zeros
         # This means the adapter starts as identity (no change)
         self.lora_A = mx.random.normal((rank, in_features)) * 0.01
         self.lora_B = mx.zeros((out_features, rank))
-        
+
         self.dropout = dropout
         self._training = True
-    
+
     def __call__(self, x: mx.array) -> mx.array:
         """
         Forward pass with LoRA adaptation.
-        
+
         Args:
             x: Input tensor
-            
+
         Returns:
             Output with LoRA adaptation applied
         """
         # Original layer output
         original_output = self.original_layer(x)
-        
+
         # LoRA adaptation: x @ A.T @ B.T * scaling
         if self._training and self.dropout > 0:
             # Apply dropout during training
@@ -115,19 +115,19 @@ class LoRALinear(nn.Module):
             lora_output = (x_dropped @ self.lora_A.T) @ self.lora_B.T
         else:
             lora_output = (x @ self.lora_A.T) @ self.lora_B.T
-        
+
         return original_output + lora_output * self.scaling
-    
+
     def merge_weights(self) -> None:
         """
         Merge LoRA weights into the original layer.
-        
+
         This is useful for inference when you want to use the adapted
         model without LoRA overhead.
         """
         delta_w = (self.lora_B @ self.lora_A) * self.scaling
         self.original_layer.weight = self.original_layer.weight + delta_w
-    
+
     def parameters(self) -> Dict[str, mx.array]:
         """Return only the trainable LoRA parameters."""
         return {
@@ -142,24 +142,23 @@ def apply_lora_to_model(
 ) -> nn.Module:
     """
     Apply LoRA adapters to specified layers in the model.
-    
+
     Args:
         model: The model to adapt
         config: LoRA configuration
-        
+
     Returns:
         Model with LoRA adapters applied
     """
+
     def apply_lora_recursive(module: nn.Module, path: str = "") -> None:
         """Recursively apply LoRA to matching layers."""
         for name, child in module.named_modules():
             full_path = f"{path}.{name}" if path else name
-            
+
             # Check if this is a target module
-            is_target = any(
-                target in name for target in config.target_modules
-            )
-            
+            is_target = any(target in name for target in config.target_modules)
+
             if is_target and isinstance(child, nn.Linear):
                 # Replace with LoRA-wrapped version
                 lora_layer = LoRALinear(
@@ -168,16 +167,16 @@ def apply_lora_to_model(
                     alpha=config.alpha,
                     dropout=config.dropout,
                 )
-                
+
                 # Set the layer in the parent module
                 parent = module
                 parts = name.split(".")
                 for part in parts[:-1]:
                     parent = getattr(parent, part)
                 setattr(parent, parts[-1], lora_layer)
-                
+
                 logger.debug(f"Applied LoRA to: {full_path}")
-    
+
     # Count original parameters
     original_params = 0
     for _, p in tree_flatten(model.parameters()):
@@ -186,20 +185,20 @@ def apply_lora_to_model(
                 original_params += p.size * 8
             else:
                 original_params += p.size
-    
+
     apply_lora_recursive(model)
-    
+
     # Count LoRA parameters
     lora_params = 0
     for _, module in model.named_modules():
         if isinstance(module, LoRALinear):
             lora_params += module.lora_A.size + module.lora_B.size
-    
+
     logger.info(
-        f"LoRA applied. Original params: {original_params/1e6:.1f}M, "
-        f"LoRA params: {lora_params/1e6:.2f}M ({100*lora_params/original_params:.2f}%)"
+        f"LoRA applied. Original params: {original_params / 1e6:.1f}M, "
+        f"LoRA params: {lora_params / 1e6:.2f}M ({100 * lora_params / original_params:.2f}%)"
     )
-    
+
     return model
 
 
@@ -224,16 +223,16 @@ def get_lora_parameters(model: nn.Module) -> Dict[str, mx.array]:
     return lora_params
 
 
-@dataclass 
+@dataclass
 class TrainingMetrics:
     """Metrics from a training run."""
-    
+
     total_steps: int = 0
     total_loss: float = 0.0
     avg_loss: float = 0.0
     learning_rate: float = 0.0
     training_time_seconds: float = 0.0
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "total_steps": self.total_steps,
@@ -246,11 +245,11 @@ class TrainingMetrics:
 class LoRATrainer:
     """
     Trainer for LoRA fine-tuning of the draft model.
-    
+
     Trains the draft model to better match the target model's outputs
     on cases where the draft model previously had low acceptance rates.
     """
-    
+
     def __init__(
         self,
         model: nn.Module,
@@ -265,7 +264,7 @@ class LoRATrainer:
     ):
         """
         Initialize the trainer.
-        
+
         Args:
             model: Draft model to train
             tokenizer: Tokenizer for encoding
@@ -287,30 +286,30 @@ class LoRATrainer:
         self.max_grad_norm = max_grad_norm
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Apply LoRA to model
         self.model = apply_lora_to_model(model, lora_config)
-        
+
         # Get trainable parameters (LoRA only)
         self.trainable_params = get_lora_parameters(self.model)
-        
+
         # Setup optimizer (AdamW works well for LoRA)
         self.optimizer = optim.AdamW(
             learning_rate=learning_rate,
             weight_decay=0.01,
         )
-        
+
         self.global_step = 0
         self.best_loss = float("inf")
-    
+
     def _get_lr(self, step: int, total_steps: int) -> float:
         """
         Get learning rate with warmup and cosine decay.
-        
+
         Args:
             step: Current step
             total_steps: Total training steps
-            
+
         Returns:
             Learning rate for this step
         """
@@ -321,46 +320,46 @@ class LoRATrainer:
             # Cosine decay
             progress = (step - self.warmup_steps) / (total_steps - self.warmup_steps)
             return self.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
-    
+
     def _prepare_batch(
         self,
         examples: List[TrainingExample],
     ) -> Tuple[mx.array, mx.array]:
         """
         Prepare a training batch from examples.
-        
+
         The training objective is to make the draft model output the same
         tokens as the target model. We use teacher forcing with cross-entropy loss.
-        
+
         Args:
             examples: List of training examples
-            
+
         Returns:
             Tuple of (input_ids, target_ids) as MLX arrays
         """
         max_length = 512  # Configurable
-        
+
         input_ids_list = []
         target_ids_list = []
-        
+
         for ex in examples:
             # Encode prompt
             prompt_ids = self.tokenizer.encode(ex.prompt)
-            
+
             # Target is what the target model would have generated
-            target_tokens = ex.target_output[:max_length - len(prompt_ids)]
-            
+            target_tokens = ex.target_output[: max_length - len(prompt_ids)]
+
             # Skip examples with no target tokens (nothing to learn from)
             # This happens when prompt is already at or exceeds max_length
             if len(target_tokens) == 0:
                 continue
-            
+
             # Input is prompt + target (for teacher forcing)
             # Shift right: input is [prompt, target[:-1]]
             full_input = prompt_ids + target_tokens[:-1]
             # Shift left: targets are [prompt[1:], target]
             targets = prompt_ids[1:] + target_tokens
-            
+
             # Ensure both sequences have the same length
             # This should always be true, but verify for safety
             assert len(full_input) == len(targets), (
@@ -368,19 +367,21 @@ class LoRATrainer:
                 f"targets={len(targets)}, prompt_len={len(prompt_ids)}, "
                 f"target_len={len(target_tokens)}"
             )
-            
+
             # Pad to max length
             pad_length = max_length - len(full_input)
             if pad_length > 0:
-                full_input = full_input + [self.tokenizer.pad_token_id or 0] * pad_length
+                full_input = (
+                    full_input + [self.tokenizer.pad_token_id or 0] * pad_length
+                )
                 targets = targets + [-100] * pad_length  # -100 = ignore in loss
             else:
                 full_input = full_input[:max_length]
                 targets = targets[:max_length]
-            
+
             input_ids_list.append(full_input)
             target_ids_list.append(targets)
-        
+
         # Handle case where all examples were skipped
         if len(input_ids_list) == 0:
             # Return empty arrays with correct shape
@@ -388,12 +389,12 @@ class LoRATrainer:
                 mx.array([], dtype=mx.int32).reshape(0, max_length),
                 mx.array([], dtype=mx.int32).reshape(0, max_length),
             )
-        
+
         return (
             mx.array(input_ids_list),
             mx.array(target_ids_list),
         )
-    
+
     def _compute_loss(
         self,
         input_ids: mx.array,
@@ -401,42 +402,42 @@ class LoRATrainer:
     ) -> mx.array:
         """
         Compute cross-entropy loss.
-        
+
         Args:
             input_ids: Input token IDs [batch, seq_len]
             target_ids: Target token IDs [batch, seq_len]
-            
+
         Returns:
             Scalar loss value
         """
         # Forward pass
         logits = self.model(input_ids)
-        
+
         # Reshape for cross-entropy
         batch_size, seq_len, vocab_size = logits.shape
         logits = logits.reshape(-1, vocab_size)
         targets = target_ids.reshape(-1)
-        
+
         # Create mask for non-padding tokens
         mask = targets != -100
         targets = mx.where(mask, targets, mx.zeros_like(targets))
-        
+
         # Cross-entropy loss
         log_probs = nn.log_softmax(logits, axis=-1)
-        
+
         # Gather the log probabilities for target tokens
         target_log_probs = mx.take_along_axis(
             log_probs,
             targets[:, None],
             axis=-1,
         ).squeeze(-1)
-        
+
         # Apply mask and compute mean loss
         masked_loss = -target_log_probs * mask
         loss = masked_loss.sum() / mask.sum()
-        
+
         return loss
-    
+
     def _training_step(
         self,
         input_ids: mx.array,
@@ -444,20 +445,20 @@ class LoRATrainer:
     ) -> Tuple[float, Dict[str, mx.array]]:
         """
         Perform a single training step.
-        
+
         Args:
             input_ids: Input batch
             target_ids: Target batch
-            
+
         Returns:
             Tuple of (loss_value, gradients)
         """
         # Compute loss and gradients
         loss_and_grad_fn = nn.value_and_grad(self.model, self._compute_loss)
         loss, grads = loss_and_grad_fn(input_ids, target_ids)
-        
+
         return loss.item(), grads
-    
+
     def train(
         self,
         training_examples: List[TrainingExample],
@@ -467,58 +468,59 @@ class LoRATrainer:
     ) -> TrainingMetrics:
         """
         Train the draft model on collected examples.
-        
+
         Args:
             training_examples: List of training examples
             num_epochs: Number of training epochs
             eval_callback: Optional callback for evaluation
             save_every_n_steps: How often to save checkpoints
-            
+
         Returns:
             Training metrics
         """
         start_time = time.time()
         metrics = TrainingMetrics()
-        
+
         num_examples = len(training_examples)
         steps_per_epoch = math.ceil(num_examples / self.batch_size)
         total_steps = steps_per_epoch * num_epochs
-        
+
         logger.info(
             f"Starting LoRA training: {num_examples} examples, "
             f"{num_epochs} epochs, {total_steps} total steps"
         )
-        
+
         accumulated_grads = None
         accumulated_loss = 0.0
-        
+
         for epoch in range(num_epochs):
             epoch_loss = 0.0
-            
+
             # Shuffle examples each epoch
             import random
+
             shuffled = training_examples.copy()
             random.shuffle(shuffled)
-            
+
             for step in range(steps_per_epoch):
                 # Get batch
                 start_idx = step * self.batch_size
                 end_idx = min(start_idx + self.batch_size, num_examples)
                 batch_examples = shuffled[start_idx:end_idx]
-                
+
                 if not batch_examples:
                     continue
-                
+
                 # Prepare batch
                 input_ids, target_ids = self._prepare_batch(batch_examples)
-                
+
                 # Skip empty batches (can happen if all examples were filtered out)
                 if input_ids.shape[0] == 0:
                     continue
-                
+
                 # Training step
                 loss, grads = self._training_step(input_ids, target_ids)
-                
+
                 # Accumulate gradients
                 if accumulated_grads is None:
                     accumulated_grads = grads
@@ -529,7 +531,7 @@ class LoRATrainer:
                         grads,
                     )
                 accumulated_loss += loss
-                
+
                 # Update weights after accumulation steps
                 if (step + 1) % self.gradient_accumulation_steps == 0:
                     # Average gradients
@@ -537,82 +539,88 @@ class LoRATrainer:
                         lambda g: g / self.gradient_accumulation_steps,
                         accumulated_grads,
                     )
-                    
+
                     # Gradient clipping
                     grad_sq_sum = 0.0
                     for _, g in tree_flatten(accumulated_grads):
                         if hasattr(g, "size"):
-                            grad_sq_sum += mx.sum(g ** 2).item()
-                    grad_norm = grad_sq_sum ** 0.5
-                    
+                            grad_sq_sum += mx.sum(g**2).item()
+                    grad_norm = grad_sq_sum**0.5
+
                     if grad_norm > self.max_grad_norm:
                         scale = self.max_grad_norm / grad_norm
                         accumulated_grads = tree_map(
                             lambda g: g * scale,
                             accumulated_grads,
                         )
-                    
+
                     # Update learning rate
                     current_lr = self._get_lr(self.global_step, total_steps)
                     self.optimizer.learning_rate = current_lr
-                    
+
                     # Apply gradients
                     self.optimizer.update(self.model, accumulated_grads)
                     mx.eval(self.model.parameters())
-                    
+
                     # Log progress
-                    avg_accumulated_loss = accumulated_loss / self.gradient_accumulation_steps
-                    
+                    avg_accumulated_loss = (
+                        accumulated_loss / self.gradient_accumulation_steps
+                    )
+
                     if self.global_step % 10 == 0:
                         logger.info(
-                            f"Epoch {epoch+1}/{num_epochs}, "
+                            f"Epoch {epoch + 1}/{num_epochs}, "
                             f"Step {self.global_step}/{total_steps}, "
                             f"Loss: {avg_accumulated_loss:.4f}, "
                             f"LR: {current_lr:.2e}"
                         )
-                    
+
                     epoch_loss += avg_accumulated_loss
                     metrics.total_loss += avg_accumulated_loss
-                    
+
                     # Reset accumulation
                     accumulated_grads = None
                     accumulated_loss = 0.0
-                    
+
                     self.global_step += 1
                     metrics.total_steps = self.global_step
-                    
+
                     # Save checkpoint
                     if self.global_step % save_every_n_steps == 0:
                         self.save_checkpoint(f"step_{self.global_step}")
-            
+
             # End of epoch
-            avg_epoch_loss = epoch_loss / max(1, steps_per_epoch // self.gradient_accumulation_steps)
-            logger.info(f"Epoch {epoch+1} complete. Average loss: {avg_epoch_loss:.4f}")
-            
+            avg_epoch_loss = epoch_loss / max(
+                1, steps_per_epoch // self.gradient_accumulation_steps
+            )
+            logger.info(
+                f"Epoch {epoch + 1} complete. Average loss: {avg_epoch_loss:.4f}"
+            )
+
             # Evaluation callback
             if eval_callback:
                 eval_callback(epoch, avg_epoch_loss)
-            
+
             # Save best model
             if avg_epoch_loss < self.best_loss:
                 self.best_loss = avg_epoch_loss
                 self.save_checkpoint("best")
-        
+
         # Final metrics
         metrics.training_time_seconds = time.time() - start_time
         metrics.avg_loss = metrics.total_loss / max(1, metrics.total_steps)
         metrics.learning_rate = self.learning_rate
-        
+
         # Save final checkpoint
         self.save_checkpoint("final")
-        
+
         logger.info(
             f"Training complete. Total time: {metrics.training_time_seconds:.1f}s, "
             f"Average loss: {metrics.avg_loss:.4f}"
         )
-        
+
         return metrics
-    
+
     def save_checkpoint(self, name: str) -> str:
         """
         Save a training checkpoint in MLX-LM compatible format.
@@ -651,7 +659,9 @@ class LoRATrainer:
             "num_layers": -1,  # All layers
             "lora_parameters": {
                 "rank": self.lora_config.rank,
-                "scale": float(self.lora_config.alpha),  # MLX-LM uses 'scale' not 'alpha'
+                "scale": float(
+                    self.lora_config.alpha
+                ),  # MLX-LM uses 'scale' not 'alpha'
                 "dropout": self.lora_config.dropout,
             },
         }
@@ -676,7 +686,7 @@ class LoRATrainer:
 
         logger.info(f"Saved checkpoint: {checkpoint_path}")
         return str(checkpoint_path)
-    
+
     def load_checkpoint(self, checkpoint_path: str) -> None:
         """
         Load a training checkpoint.
@@ -723,6 +733,7 @@ class LoRATrainer:
 
         # Load training state
         import json
+
         state_path = checkpoint_path / "trainer_state.json"
         if state_path.exists():
             with open(state_path, "r") as f:
@@ -733,7 +744,9 @@ class LoRATrainer:
         else:
             logger.warning(f"trainer_state.json not found in {checkpoint_path}")
 
-        logger.info(f"Loaded checkpoint from: {checkpoint_path} ({loaded_count} LoRA layers)")
+        logger.info(
+            f"Loaded checkpoint from: {checkpoint_path} ({loaded_count} LoRA layers)"
+        )
 
     def fuse_and_get_model(self) -> nn.Module:
         """
@@ -784,7 +797,7 @@ class LoRATrainer:
         original = lora_layer.original_layer
 
         # Check if it's a quantized layer
-        is_quantized = hasattr(original, 'scales')
+        is_quantized = hasattr(original, "scales")
 
         if is_quantized:
             # Dequantize first for fusion
@@ -810,7 +823,7 @@ class LoRATrainer:
         fused_weight = weight + delta
 
         # Check for bias
-        has_bias = hasattr(original, 'bias') and original.bias is not None
+        has_bias = hasattr(original, "bias") and original.bias is not None
 
         # Create clean linear layer
         out_features, in_features = fused_weight.shape
@@ -842,7 +855,7 @@ def quick_lora_finetune(
 ) -> Tuple[nn.Module, TrainingMetrics]:
     """
     Quick helper function to run LoRA fine-tuning.
-    
+
     Args:
         model: Model to fine-tune
         tokenizer: Tokenizer
@@ -851,7 +864,7 @@ def quick_lora_finetune(
         num_epochs: Training epochs
         learning_rate: Learning rate
         checkpoint_dir: Checkpoint directory
-        
+
     Returns:
         Tuple of (trained_model, metrics)
     """
@@ -861,7 +874,7 @@ def quick_lora_finetune(
         dropout=0.05,
         target_modules=["q_proj", "v_proj"],
     )
-    
+
     trainer = LoRATrainer(
         model=model,
         tokenizer=tokenizer,
@@ -869,7 +882,7 @@ def quick_lora_finetune(
         learning_rate=learning_rate,
         checkpoint_dir=checkpoint_dir,
     )
-    
+
     metrics = trainer.train(examples, num_epochs=num_epochs)
-    
+
     return trainer.model, metrics

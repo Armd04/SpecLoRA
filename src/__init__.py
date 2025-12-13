@@ -35,6 +35,7 @@ try:
         ManualSpeculativeDecoder,
         run_data_collection_batch,
     )
+
     _MLX_AVAILABLE = True
 except ImportError:
     # MLX not available (likely not on Apple Silicon)

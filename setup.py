@@ -33,6 +33,7 @@ setup(
             "pytest>=7.4.0",
             "black>=23.0.0",
             "isort>=5.12.0",
+            "ruff>=0.14.0",
         ],
     },
     entry_points={

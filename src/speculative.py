@@ -30,39 +30,39 @@ logger = logging.getLogger(__name__)
 @dataclass
 class GenerationMetrics:
     """Tracks metrics during speculative decoding generation."""
-    
+
     # Token counts
     total_tokens_generated: int = 0
     draft_tokens_proposed: int = 0
     draft_tokens_accepted: int = 0
-    
+
     # Timing
     total_time_seconds: float = 0.0
     draft_time_seconds: float = 0.0
     verify_time_seconds: float = 0.0
-    
+
     # Per-step acceptance rates
     step_acceptance_rates: List[float] = field(default_factory=list)
-    
+
     @property
     def acceptance_rate(self) -> float:
         """Overall acceptance rate of draft tokens."""
         if self.draft_tokens_proposed == 0:
             return 0.0
         return self.draft_tokens_accepted / self.draft_tokens_proposed
-    
+
     @property
     def tokens_per_second(self) -> float:
         """Generation speed in tokens per second."""
         if self.total_time_seconds == 0:
             return 0.0
         return self.total_tokens_generated / self.total_time_seconds
-    
+
     @property
     def speedup_factor(self) -> float:
         """
         Estimated speedup vs standard decoding.
-        
+
         In standard decoding, each token requires a full forward pass.
         With speculative decoding, we do (1 draft pass + 1 verify pass)
         to potentially generate multiple tokens.
@@ -72,7 +72,7 @@ class GenerationMetrics:
         # Simplified estimate: speedup ≈ avg_accepted + 1 per iteration
         avg_accepted = self.acceptance_rate * 4  # Assuming K=4
         return max(1.0, avg_accepted + 1) / 2  # Divide by 2 for draft+verify
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert metrics to dictionary for logging."""
         return {
@@ -88,25 +88,25 @@ class GenerationMetrics:
 @dataclass
 class SpeculativeResult:
     """Result from a speculative decoding generation."""
-    
+
     # Generated text
     text: str
-    
+
     # Token IDs generated
     tokens: List[int]
-    
+
     # Generation metrics
     metrics: GenerationMetrics
-    
+
     # Input prompt (for failure case collection)
     prompt: str
-    
+
     # Whether this is considered a "failure" case (low acceptance)
     is_failure_case: bool = False
-    
+
     # Draft model's outputs (for training)
     draft_outputs: Optional[List[int]] = None
-    
+
     # Target model's outputs (for training)
     target_outputs: Optional[List[int]] = None
 
@@ -155,9 +155,14 @@ class SpeculativeDecoder:
         self.temperature = temperature
         self.top_p = top_p
         self.acceptance_threshold = acceptance_threshold
-        self.system_message = system_message or "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+        self.system_message = (
+            system_message
+            or "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+        )
 
-        if not hasattr(tokenizer, 'apply_chat_template') or not callable(tokenizer.apply_chat_template):
+        if not hasattr(tokenizer, "apply_chat_template") or not callable(
+            tokenizer.apply_chat_template
+        ):
             raise ValueError(
                 "SpeculativeDecoder requires a tokenizer with apply_chat_template(). "
                 "Please select a chat model/tokenizer pair that provides it."
@@ -283,7 +288,7 @@ class SpeculativeDecoder:
             draft_outputs=draft_all_outputs,
             target_outputs=target_all_outputs,
         )
-    
+
     def generate_standard(
         self,
         prompt: str,
@@ -323,22 +328,22 @@ class SpeculativeDecoder:
         mx.clear_cache()
 
         return text, elapsed
-    
+
     def create_manual_decoder(self) -> "ManualSpeculativeDecoder":
         """
         Create a ManualSpeculativeDecoder with the same configuration.
-        
+
         The manual decoder implements speculative decoding from scratch to
         capture detailed token-level disagreements for training. It's slower
         than the built-in version (~20%) but provides much more training signal.
-        
+
         Use this for data collection runs, not production inference.
-        
+
         Returns:
             ManualSpeculativeDecoder configured with same models and settings
         """
         from .speculative_manual import ManualSpeculativeDecoder
-        
+
         return ManualSpeculativeDecoder(
             target_model=self.target_model,
             draft_model=self.draft_model,
@@ -349,7 +354,7 @@ class SpeculativeDecoder:
             acceptance_threshold=self.acceptance_threshold,
             system_message=self.system_message,
         )
-    
+
     def generate_detailed(
         self,
         prompt: str,
@@ -357,15 +362,15 @@ class SpeculativeDecoder:
     ) -> "ManualSpeculativeResult":
         """
         Generate text using manual speculative decoding with token-level data.
-        
+
         This method uses the ManualSpeculativeDecoder internally to capture
         detailed disagreement information. It's slower than generate() but
         provides more valuable training data.
-        
+
         Args:
             prompt: Input prompt text
             max_tokens: Maximum tokens to generate
-            
+
         Returns:
             ManualSpeculativeResult with token-level disagreement data
         """
@@ -380,12 +385,12 @@ def run_acceptance_benchmark(
 ) -> Dict[str, Any]:
     """
     Run a benchmark to measure acceptance rates across prompts.
-    
+
     Args:
         decoder: Configured speculative decoder
         prompts: List of test prompts
         max_tokens: Max tokens per generation
-        
+
     Returns:
         Dictionary with benchmark results
     """
@@ -396,10 +401,10 @@ def run_acceptance_benchmark(
         "total_proposed": 0,
         "total_time": 0.0,
     }
-    
+
     for prompt in prompts:
         result = decoder.generate(prompt, max_tokens=max_tokens)
-        
+
         prompt_result = {
             "prompt": prompt[:50] + "..." if len(prompt) > 50 else prompt,
             "acceptance_rate": result.metrics.acceptance_rate,
@@ -408,12 +413,12 @@ def run_acceptance_benchmark(
             "is_failure": result.is_failure_case,
         }
         results["per_prompt"].append(prompt_result)
-        
+
         results["total_tokens"] += result.metrics.total_tokens_generated
         results["total_accepted"] += result.metrics.draft_tokens_accepted
         results["total_proposed"] += result.metrics.draft_tokens_proposed
         results["total_time"] += result.metrics.total_time_seconds
-    
+
     # Calculate aggregates
     if results["total_proposed"] > 0:
         results["overall_acceptance_rate"] = (
@@ -421,12 +426,12 @@ def run_acceptance_benchmark(
         )
     else:
         results["overall_acceptance_rate"] = 0.0
-    
+
     if results["total_time"] > 0:
         results["overall_tokens_per_second"] = (
             results["total_tokens"] / results["total_time"]
         )
     else:
         results["overall_tokens_per_second"] = 0.0
-    
+
     return results

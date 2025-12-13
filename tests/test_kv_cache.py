@@ -57,7 +57,7 @@ def test_create_kv_cache_falls_back_to_layers_list():
     for entry in cache:
         if entry is not None:
             # If it's a KVCache, it should have offset attribute
-            assert hasattr(entry, 'offset')
+            assert hasattr(entry, "offset")
 
 
 def test_get_logits_with_cache_preserves_cache_and_shapes():
@@ -118,4 +118,3 @@ def test_get_cache_length_handles_common_structures():
     assert get_cache_length(list_cache) == 5
     # Empty cache should report zero
     assert get_cache_length(None) == 0
-
