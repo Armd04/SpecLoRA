@@ -331,12 +331,16 @@ class LoRATrainer:
         The training objective is to make the draft model output the same
         tokens as the target model. We use teacher forcing with cross-entropy loss.
 
-        For each example:
-        - Input:  [prompt tokens, target_output[0], target_output[1], ..., target_output[-2]]
-        - Labels: [-100 (masked), ..., -100, target_output[0], target_output[1], ..., target_output[-1]]
+        For each example with prompt [p0, p1, p2] and generation [g0, g1, g2]:
+        - Full sequence: [p0, p1, p2, g0, g1, g2]
+        - Input:  [p0, p1, p2, g0, g1]  (all but last)
+        - Target: [p1, p2, g0, g1, g2]  (all but first, shifted)
+        - Masked: [-100, -100, g0, g1, g2]  (mask prompt→prompt, keep prompt→gen transition!)
 
-        We mask the prompt tokens in the labels (set to -100) so we only train on
-        predicting the target model's generation, not reconstructing the prompt.
+        Key insight: We mask positions 0 to len(prompt)-2 to avoid training on
+        prompt reconstruction, BUT we keep position len(prompt)-1 which represents
+        the critical transition from the last prompt token to the first generation
+        token. This is essential for the model to learn how to start generating.
 
         Args:
             examples: List of training examples
@@ -373,14 +377,33 @@ class LoRATrainer:
                 logger.warning(f"Skipping example {ex.id}: no target tokens to learn from")
                 continue
 
-            # Teacher forcing:
-            # Input sequence: [prompt, target[:-1]]  (predict next token at each position)
-            # Target sequence: [-100, ..., -100 (for prompt), target[0], target[1], ..., target[-1]]
-            #                   └─ masked (don't train) ─┘  └──── train on these ─────┘
+            # Teacher forcing with autoregressive next-token prediction:
+            #
+            # Full sequence: [prompt[0], prompt[1], ..., prompt[n-1], gen[0], gen[1], ..., gen[m-1]]
+            #
+            # Input:  [prompt[0], prompt[1], ..., prompt[n-1], gen[0], ..., gen[m-2]]
+            # Target: [prompt[1], prompt[2], ..., gen[0],      gen[1], ..., gen[m-1]]
+            #
+            # Masking strategy:
+            # - Mask positions 0 to n-2: prompt tokens predicting other prompt tokens (don't train)
+            # - Position n-1 (last prompt) predicting gen[0]: TRAIN on this! (critical transition)
+            # - Positions n onwards: generation tokens (train on all)
+            #
+            # Result after masking:
+            # Target: [-100,      -100,      ..., gen[0], gen[1], ..., gen[m-1]]
+            #          └─────── masked ─────────┘  └───── train on these ──────┘
 
-            full_input = prompt_ids + target_tokens[:-1]
-            # Mask prompt tokens with -100 (don't compute loss on them)
-            targets = [-100] * prompt_len + target_tokens
+            # Create full sequence (prompt + generation)
+            full_sequence = prompt_ids + target_tokens
+
+            # Standard teacher forcing: input is all but last, target is all but first
+            full_input = full_sequence[:-1]
+            targets = full_sequence[1:]
+
+            # Mask prompt-to-prompt predictions (positions 0 to prompt_len-2)
+            # But DO NOT mask position prompt_len-1, which is the critical prompt→generation transition
+            for i in range(prompt_len - 1):
+                targets[i] = -100
 
             # Verify lengths match
             assert len(full_input) == len(targets), (

@@ -6,10 +6,10 @@ The training script had **critical bugs** causing NaN losses and performance iss
 
 ## Issues Found and Fixed
 
-### 🔴 CRITICAL: Issue #1 - Broken Teacher Forcing Logic
+### 🔴 CRITICAL: Issue #1 - Broken Teacher Forcing Logic (FIXED TWICE!)
 **File:** `src/training.py`, method `_prepare_batch()` (lines 324-419)
 
-**Problem:**
+**Problem #1 (Initial Bug):**
 The original implementation incorrectly aligned input and target sequences:
 ```python
 # WRONG (original code):
@@ -17,24 +17,42 @@ full_input = prompt_ids + target_tokens[:-1]
 targets = prompt_ids[1:] + target_tokens
 ```
 
-This meant:
-- Input position 0: prompt[0] → Target: prompt[1] ❌ (training to predict prompt from prompt!)
-- Input position N: target[N-len(prompt)-1] → Target: target[N-len(prompt)] ❌ (wrong alignment!)
+This trained the model to reconstruct the prompt from itself - completely wrong!
 
-**Fix:**
-Correctly implement teacher forcing with masked prompts:
+**Fix #1 (Incomplete):**
 ```python
-# CORRECT (new code):
+# BETTER but still wrong:
 full_input = prompt_ids + target_tokens[:-1]
 targets = [-100] * len(prompt_ids) + target_tokens
 ```
 
-Now:
-- Prompt positions are masked with -100 (no loss computed) ✅
-- Only train on predicting the target model's generation ✅
-- Proper autoregressive alignment ✅
+This had TWO bugs:
+1. **Length mismatch**: input length = 5, target length = 6 → assertion would fail!
+2. **Masked critical transition**: Position where prompt ends and generation begins was masked with -100, so the model never learned how to START generating!
 
-**Impact:** This was the PRIMARY cause of NaN losses and poor training!
+**Fix #2 (CORRECT):**
+```python
+# CORRECT (current code):
+full_sequence = prompt_ids + target_tokens
+full_input = full_sequence[:-1]  # All but last
+targets = full_sequence[1:]      # All but first (shifted)
+# Mask prompt→prompt (but NOT prompt→generation transition!)
+for i in range(len(prompt_ids) - 1):
+    targets[i] = -100
+```
+
+Now:
+- Lengths match perfectly ✅
+- Prompt→prompt predictions masked ✅
+- **Prompt→generation transition is TRAINED** ✅ (this is critical!)
+- Proper autoregressive next-token prediction ✅
+
+**Why the second fix matters:**
+With prompt [1,2,3] and generation [4,5,6]:
+- **Before:** Position 2 (last prompt) had target=-100 → Model never learns "after seeing [1,2,3], start with 4"
+- **After:** Position 2 has target=4 → Model learns the critical transition to begin generation!
+
+**Impact:** This was the PRIMARY cause of NaN losses and poor training. The second fix ensures the model actually learns to generate properly!
 
 ---
 
