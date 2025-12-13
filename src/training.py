@@ -331,6 +331,13 @@ class LoRATrainer:
         The training objective is to make the draft model output the same
         tokens as the target model. We use teacher forcing with cross-entropy loss.
 
+        For each example:
+        - Input:  [prompt tokens, target_output[0], target_output[1], ..., target_output[-2]]
+        - Labels: [-100 (masked), ..., -100, target_output[0], target_output[1], ..., target_output[-1]]
+
+        We mask the prompt tokens in the labels (set to -100) so we only train on
+        predicting the target model's generation, not reconstructing the prompt.
+
         Args:
             examples: List of training examples
 
@@ -345,26 +352,40 @@ class LoRATrainer:
         for ex in examples:
             # Encode prompt
             prompt_ids = self.tokenizer.encode(ex.prompt)
+            prompt_len = len(prompt_ids)
 
-            # Target is what the target model would have generated
-            target_tokens = ex.target_output[: max_length - len(prompt_ids)]
-
-            # Skip examples with no target tokens (nothing to learn from)
-            # This happens when prompt is already at or exceeds max_length
-            if len(target_tokens) == 0:
+            # Target tokens are what the target model generated (not including prompt)
+            # Take as many as will fit: max_length = prompt_len + generation_len
+            available_space = max_length - prompt_len - 1  # -1 for at least one generation token
+            if available_space <= 0:
+                # Prompt is too long, skip this example
+                logger.warning(
+                    f"Skipping example {ex.id}: prompt length {prompt_len} "
+                    f"exceeds max_length {max_length}"
+                )
                 continue
 
-            # Input is prompt + target (for teacher forcing)
-            # Shift right: input is [prompt, target[:-1]]
-            full_input = prompt_ids + target_tokens[:-1]
-            # Shift left: targets are [prompt[1:], target]
-            targets = prompt_ids[1:] + target_tokens
+            # Get target tokens (the generation, not the prompt)
+            target_tokens = ex.target_output[:available_space]
 
-            # Ensure both sequences have the same length
-            # This should always be true, but verify for safety
+            # Skip examples with no target tokens (nothing to learn from)
+            if len(target_tokens) == 0:
+                logger.warning(f"Skipping example {ex.id}: no target tokens to learn from")
+                continue
+
+            # Teacher forcing:
+            # Input sequence: [prompt, target[:-1]]  (predict next token at each position)
+            # Target sequence: [-100, ..., -100 (for prompt), target[0], target[1], ..., target[-1]]
+            #                   └─ masked (don't train) ─┘  └──── train on these ─────┘
+
+            full_input = prompt_ids + target_tokens[:-1]
+            # Mask prompt tokens with -100 (don't compute loss on them)
+            targets = [-100] * prompt_len + target_tokens
+
+            # Verify lengths match
             assert len(full_input) == len(targets), (
                 f"Sequence length mismatch: input={len(full_input)}, "
-                f"targets={len(targets)}, prompt_len={len(prompt_ids)}, "
+                f"targets={len(targets)}, prompt_len={prompt_len}, "
                 f"target_len={len(target_tokens)}"
             )
 
@@ -376,6 +397,7 @@ class LoRATrainer:
                 )
                 targets = targets + [-100] * pad_length  # -100 = ignore in loss
             else:
+                # Truncate if needed (shouldn't happen given our available_space check)
                 full_input = full_input[:max_length]
                 targets = targets[:max_length]
 
@@ -384,6 +406,7 @@ class LoRATrainer:
 
         # Handle case where all examples were skipped
         if len(input_ids_list) == 0:
+            logger.warning("All examples were skipped during batch preparation")
             # Return empty arrays with correct shape
             return (
                 mx.array([], dtype=mx.int32).reshape(0, max_length),
@@ -418,8 +441,17 @@ class LoRATrainer:
         logits = logits.reshape(-1, vocab_size)
         targets = target_ids.reshape(-1)
 
-        # Create mask for non-padding tokens
+        # Create mask for non-padding tokens (targets == -100 are masked)
         mask = targets != -100
+
+        # Check if we have any valid targets
+        num_valid = mask.sum()
+        if num_valid == 0:
+            logger.warning("No valid targets in batch (all masked with -100)")
+            # Return a small dummy loss to avoid NaN, but this shouldn't train
+            return mx.array(0.0)
+
+        # Replace masked positions with 0 (arbitrary valid index for gathering)
         targets = mx.where(mask, targets, mx.zeros_like(targets))
 
         # Cross-entropy loss
@@ -432,9 +464,9 @@ class LoRATrainer:
             axis=-1,
         ).squeeze(-1)
 
-        # Apply mask and compute mean loss
+        # Apply mask and compute mean loss over valid positions only
         masked_loss = -target_log_probs * mask
-        loss = masked_loss.sum() / mask.sum()
+        loss = masked_loss.sum() / num_valid
 
         return loss
 
@@ -453,9 +485,14 @@ class LoRATrainer:
         Returns:
             Tuple of (loss_value, gradients)
         """
-        # Compute loss and gradients
-        loss_and_grad_fn = nn.value_and_grad(self.model, self._compute_loss)
-        loss, grads = loss_and_grad_fn(input_ids, target_ids)
+
+        # Define loss function that takes model parameters
+        def loss_fn(model):
+            return self._compute_loss(input_ids, target_ids)
+
+        # Compute loss and gradients with respect to model parameters
+        loss_and_grad_fn = nn.value_and_grad(self.model, loss_fn)
+        loss, grads = loss_and_grad_fn(self.model)
 
         return loss.item(), grads
 
@@ -492,9 +529,11 @@ class LoRATrainer:
 
         accumulated_grads = None
         accumulated_loss = 0.0
+        valid_steps_in_accumulation = 0  # Track how many valid steps we've accumulated
 
         for epoch in range(num_epochs):
             epoch_loss = 0.0
+            skipped_batches = 0
 
             # Shuffle examples each epoch
             import random
@@ -521,6 +560,32 @@ class LoRATrainer:
                 # Training step
                 loss, grads = self._training_step(input_ids, target_ids)
 
+                # Check for NaN/Inf in loss
+                if not mx.isfinite(mx.array(loss)).item():
+                    logger.warning(
+                        f"Non-finite loss detected: {loss}. Skipping this batch. "
+                        f"This may indicate numerical instability."
+                    )
+                    skipped_batches += 1
+                    # Skip this batch
+                    continue
+
+                # Check for NaN/Inf in gradients
+                has_nan_grad = False
+                for name, g in tree_flatten(grads):
+                    if hasattr(g, "size") and g.size > 0:
+                        if not mx.all(mx.isfinite(g)).item():
+                            logger.warning(
+                                f"Non-finite gradient detected in {name}. Skipping this batch."
+                            )
+                            has_nan_grad = True
+                            break
+
+                if has_nan_grad:
+                    skipped_batches += 1
+                    # Skip this batch if gradients are invalid
+                    continue
+
                 # Accumulate gradients
                 if accumulated_grads is None:
                     accumulated_grads = grads
@@ -531,12 +596,22 @@ class LoRATrainer:
                         grads,
                     )
                 accumulated_loss += loss
+                valid_steps_in_accumulation += 1
 
                 # Update weights after accumulation steps
                 if (step + 1) % self.gradient_accumulation_steps == 0:
-                    # Average gradients
+                    # Only update if we have valid gradients
+                    if valid_steps_in_accumulation == 0:
+                        logger.warning(
+                            "No valid gradients in accumulation window. Skipping update."
+                        )
+                        accumulated_grads = None
+                        accumulated_loss = 0.0
+                        continue
+
+                    # Average gradients over valid steps only
                     accumulated_grads = tree_map(
-                        lambda g: g / self.gradient_accumulation_steps,
+                        lambda g: g / valid_steps_in_accumulation,
                         accumulated_grads,
                     )
 
@@ -563,15 +638,14 @@ class LoRATrainer:
                     mx.eval(self.model.parameters())
 
                     # Log progress
-                    avg_accumulated_loss = (
-                        accumulated_loss / self.gradient_accumulation_steps
-                    )
+                    avg_accumulated_loss = accumulated_loss / valid_steps_in_accumulation
 
                     if self.global_step % 10 == 0:
                         logger.info(
                             f"Epoch {epoch + 1}/{num_epochs}, "
                             f"Step {self.global_step}/{total_steps}, "
                             f"Loss: {avg_accumulated_loss:.4f}, "
+                            f"Grad Norm: {grad_norm:.4f}, "
                             f"LR: {current_lr:.2e}"
                         )
 
@@ -581,6 +655,7 @@ class LoRATrainer:
                     # Reset accumulation
                     accumulated_grads = None
                     accumulated_loss = 0.0
+                    valid_steps_in_accumulation = 0
 
                     self.global_step += 1
                     metrics.total_steps = self.global_step
@@ -593,6 +668,14 @@ class LoRATrainer:
             avg_epoch_loss = epoch_loss / max(
                 1, steps_per_epoch // self.gradient_accumulation_steps
             )
+
+            # Report skipped batches
+            if skipped_batches > 0:
+                logger.warning(
+                    f"Epoch {epoch + 1}: Skipped {skipped_batches} batches due to "
+                    f"NaN/Inf values ({skipped_batches / steps_per_epoch * 100:.1f}%)"
+                )
+
             logger.info(
                 f"Epoch {epoch + 1} complete. Average loss: {avg_epoch_loss:.4f}"
             )
