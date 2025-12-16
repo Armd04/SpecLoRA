@@ -360,7 +360,9 @@ class LoRATrainer:
 
             # Target tokens are what the target model generated (not including prompt)
             # Take as many as will fit: max_length = prompt_len + generation_len
-            available_space = max_length - prompt_len - 1  # -1 for at least one generation token
+            available_space = (
+                max_length - prompt_len - 1
+            )  # -1 for at least one generation token
             if available_space <= 0:
                 # Prompt is too long, skip this example
                 logger.warning(
@@ -374,7 +376,9 @@ class LoRATrainer:
 
             # Skip examples with no target tokens (nothing to learn from)
             if len(target_tokens) == 0:
-                logger.warning(f"Skipping example {ex.id}: no target tokens to learn from")
+                logger.warning(
+                    f"Skipping example {ex.id}: no target tokens to learn from"
+                )
                 continue
 
             # Teacher forcing with autoregressive next-token prediction:
@@ -470,9 +474,13 @@ class LoRATrainer:
         # Check if we have any valid targets
         num_valid = mask.sum()
         if num_valid == 0:
-            logger.warning("No valid targets in batch (all masked with -100)")
-            # Return a small dummy loss to avoid NaN, but this shouldn't train
-            return mx.array(0.0)
+            logger.warning(
+                "No valid targets in batch (all masked with -100). "
+                "This batch will be skipped."
+            )
+            # Return NaN so the training loop skips this batch
+            # (consistent with how NaN losses from numerical instability are handled)
+            return mx.array(float("nan"))
 
         # Replace masked positions with 0 (arbitrary valid index for gathering)
         targets = mx.where(mask, targets, mx.zeros_like(targets))
@@ -661,7 +669,9 @@ class LoRATrainer:
                     mx.eval(self.model.parameters())
 
                     # Log progress
-                    avg_accumulated_loss = accumulated_loss / valid_steps_in_accumulation
+                    avg_accumulated_loss = (
+                        accumulated_loss / valid_steps_in_accumulation
+                    )
 
                     if self.global_step % 10 == 0:
                         logger.info(
