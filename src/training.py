@@ -447,6 +447,7 @@ class LoRATrainer:
 
     def _compute_loss(
         self,
+        model: nn.Module,
         input_ids: mx.array,
         target_ids: mx.array,
     ) -> mx.array:
@@ -454,6 +455,7 @@ class LoRATrainer:
         Compute cross-entropy loss.
 
         Args:
+            model: The model to compute loss for (passed by nn.value_and_grad)
             input_ids: Input token IDs [batch, seq_len]
             target_ids: Target token IDs [batch, seq_len]
 
@@ -461,7 +463,7 @@ class LoRATrainer:
             Scalar loss value
         """
         # Forward pass
-        logits = self.model(input_ids)
+        logits = model(input_ids)
 
         # Reshape for cross-entropy
         batch_size, seq_len, vocab_size = logits.shape
@@ -517,13 +519,10 @@ class LoRATrainer:
             Tuple of (loss_value, gradients)
         """
 
-        # Define loss function that takes model parameters
-        def loss_fn(model):
-            return self._compute_loss(input_ids, target_ids)
-
         # Compute loss and gradients with respect to model parameters
-        loss_and_grad_fn = nn.value_and_grad(self.model, loss_fn)
-        loss, grads = loss_and_grad_fn(self.model)
+        # Following MLX pattern: loss function takes model as first parameter
+        loss_and_grad_fn = nn.value_and_grad(self.model, self._compute_loss)
+        loss, grads = loss_and_grad_fn(self.model, input_ids, target_ids)
 
         return loss.item(), grads
 
