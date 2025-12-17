@@ -42,18 +42,18 @@ training:
   lora:
     rank: 8
     alpha: 16
-    dropout: 0.05
+    dropout: 0.0  # Disable dropout for stability during training
     # Layers to apply LoRA (use fewer for memory efficiency)
     target_modules:
       - "q_proj"
       - "v_proj"
   
   # Training parameters
-  learning_rate: 1.0e-4
+  learning_rate: 5.0e-5  # Lower learning rate for stability
   batch_size: 1
   gradient_accumulation_steps: 4
   num_epochs: 3
-  warmup_steps: 10
+  warmup_steps: 20  # Longer warmup for stability
   
   # When to trigger training
   min_failure_cases: 10

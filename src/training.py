@@ -106,34 +106,34 @@ class LoRALinear(nn.Module):
             )
             self.weight_dtype = original_layer.scales.dtype
 
-            # Store dequantized weight as frozen (we won't update it directly)
-            # Use mx.stop_gradient to prevent gradient flow through base weights
-            self._frozen_weight = mx.stop_gradient(weight)
+            # Store dequantized weight as frozen - use object.__setattr__ to bypass
+            # MLX's parameter tracking so these won't be included in parameters()
+            object.__setattr__(self, "_frozen_weight", weight)
 
             # Handle bias
             self._has_bias = hasattr(original_layer, "bias") and original_layer.bias is not None
             if self._has_bias:
-                self._frozen_bias = mx.stop_gradient(original_layer.bias)
+                object.__setattr__(self, "_frozen_bias", original_layer.bias)
             else:
-                self._frozen_bias = None
+                object.__setattr__(self, "_frozen_bias", None)
 
             in_features = weight.shape[1]
             out_features = weight.shape[0]
         else:
             # Regular linear layer - extract and freeze weights
-            # Don't store original_layer as submodule to prevent gradient flow
             self.quant_group_size = None
             self.quant_bits = None
             self.weight_dtype = original_layer.weight.dtype
 
-            # Store frozen weights (use stop_gradient to prevent gradient flow)
-            self._frozen_weight = mx.stop_gradient(original_layer.weight)
+            # Store frozen weights - use object.__setattr__ to bypass
+            # MLX's parameter tracking so these won't be included in parameters()
+            object.__setattr__(self, "_frozen_weight", original_layer.weight)
 
             self._has_bias = hasattr(original_layer, "bias") and original_layer.bias is not None
             if self._has_bias:
-                self._frozen_bias = mx.stop_gradient(original_layer.bias)
+                object.__setattr__(self, "_frozen_bias", original_layer.bias)
             else:
-                self._frozen_bias = None
+                object.__setattr__(self, "_frozen_bias", None)
 
             in_features = original_layer.weight.shape[1]
             out_features = original_layer.weight.shape[0]
@@ -147,6 +147,9 @@ class LoRALinear(nn.Module):
         self.lora_A = mx.random.normal((rank, in_features)) * (1.0 / math.sqrt(rank))
         self.lora_B = mx.zeros((out_features, rank))
 
+        # Ensure LoRA parameters are evaluated
+        mx.eval(self.lora_A, self.lora_B)
+
     def __call__(self, x: mx.array) -> mx.array:
         """
         Forward pass with LoRA adaptation.
@@ -157,10 +160,13 @@ class LoRALinear(nn.Module):
         Returns:
             Output with LoRA adaptation applied
         """
-        # Base layer computation using frozen weights (no gradients flow through these)
-        original_output = x @ self._frozen_weight.T
+        # Base layer computation using frozen weights
+        # Use stop_gradient to ensure no gradients flow through base weights
+        frozen_weight = mx.stop_gradient(self._frozen_weight)
+        original_output = x @ frozen_weight.T
         if self._frozen_bias is not None:
-            original_output = original_output + self._frozen_bias
+            frozen_bias = mx.stop_gradient(self._frozen_bias)
+            original_output = original_output + frozen_bias
 
         # LoRA adaptation: x @ A.T @ B.T * scaling
         # Gradients only flow through lora_A and lora_B
@@ -381,10 +387,17 @@ class LoRATrainer:
         # Get trainable parameters (LoRA only)
         self.trainable_params = get_lora_parameters(self.model)
 
+        # Log trainable parameter count
+        lora_param_count = sum(p.size for p in self.trainable_params.values())
+        logger.info(f"Trainable LoRA parameters: {lora_param_count:,}")
+
         # Setup optimizer (AdamW works well for LoRA)
+        # Use lower weight decay for stability
         self.optimizer = optim.AdamW(
             learning_rate=learning_rate,
             weight_decay=0.01,
+            betas=(0.9, 0.999),
+            eps=1e-8,
         )
 
         self.global_step = 0
@@ -582,8 +595,11 @@ class LoRATrainer:
         # Replace masked positions with 0 (arbitrary valid index for gathering)
         targets = mx.where(mask, targets, mx.zeros_like(targets))
 
-        # Cross-entropy loss
-        log_probs = nn.log_softmax(logits, axis=-1)
+        # Cross-entropy loss with numerical stability
+        # Subtract max for numerical stability before softmax
+        logits_max = mx.max(logits, axis=-1, keepdims=True)
+        logits_stable = logits - mx.stop_gradient(logits_max)
+        log_probs = logits_stable - mx.logsumexp(logits_stable, axis=-1, keepdims=True)
 
         # Gather the log probabilities for target tokens
         target_log_probs = mx.take_along_axis(
@@ -592,11 +608,54 @@ class LoRATrainer:
             axis=-1,
         ).squeeze(-1)
 
+        # Clamp to avoid extreme values
+        target_log_probs = mx.clip(target_log_probs, a_min=-100.0, a_max=0.0)
+
         # Apply mask and compute mean loss over valid positions only
         masked_loss = -target_log_probs * mask
         loss = masked_loss.sum() / num_valid
 
         return loss
+
+    def _filter_lora_gradients(self, grads: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Zero out non-LoRA gradients while preserving tree structure.
+
+        This ensures only LoRA weights are updated, while maintaining
+        the gradient tree structure that the optimizer expects.
+
+        Args:
+            grads: Full gradient tree from value_and_grad
+
+        Returns:
+            Gradient tree with non-LoRA gradients zeroed out
+        """
+
+        def zero_non_lora(grad_tree, path=""):
+            """Recursively zero out non-LoRA gradients."""
+            if isinstance(grad_tree, dict):
+                result = {}
+                for key, value in grad_tree.items():
+                    new_path = f"{path}.{key}" if path else key
+                    if key in ("lora_A", "lora_B"):
+                        # Keep LoRA gradients as-is
+                        result[key] = value
+                    elif isinstance(value, dict):
+                        # Recurse into nested dicts
+                        result[key] = zero_non_lora(value, new_path)
+                    elif isinstance(value, mx.array):
+                        # Zero out non-LoRA array gradients
+                        result[key] = mx.zeros_like(value)
+                    else:
+                        # Keep other values as-is
+                        result[key] = value
+                return result
+            elif isinstance(grad_tree, mx.array):
+                # Zero out any standalone arrays that aren't LoRA
+                return mx.zeros_like(grad_tree)
+            return grad_tree
+
+        return zero_non_lora(grads)
 
     def _training_step(
         self,
@@ -613,11 +672,24 @@ class LoRATrainer:
         Returns:
             Tuple of (loss_value, gradients)
         """
+        # Create a loss function that we can differentiate
+        def loss_fn(model):
+            return self._compute_loss(model, input_ids, target_ids)
 
-        # Compute loss and gradients with respect to model parameters
-        # Following MLX pattern: loss function takes model as first parameter
-        loss_and_grad_fn = nn.value_and_grad(self.model, self._compute_loss)
-        loss, grads = loss_and_grad_fn(self.model, input_ids, target_ids)
+        # Compute loss and gradients
+        loss, grads = nn.value_and_grad(self.model, loss_fn)(self.model)
+
+        # Evaluate loss and gradients to ensure computation is complete
+        mx.eval(loss)
+        grad_arrays = [v for _, v in tree_flatten(grads) if isinstance(v, mx.array)]
+        if grad_arrays:
+            mx.eval(*grad_arrays)
+
+        # Debug: Check gradient structure on first step
+        if self.global_step == 0:
+            grad_names = [name for name, _ in tree_flatten(grads)]
+            lora_grads = [n for n in grad_names if "lora" in n.lower()]
+            logger.debug(f"Total gradient entries: {len(grad_names)}, LoRA gradients: {len(lora_grads)}")
 
         return loss.item(), grads
 
@@ -723,6 +795,11 @@ class LoRATrainer:
                 accumulated_loss += loss
                 valid_steps_in_accumulation += 1
 
+                # Force evaluation to prevent computation graph from growing
+                grad_arrays = [v for _, v in tree_flatten(accumulated_grads) if isinstance(v, mx.array)]
+                if grad_arrays:
+                    mx.eval(*grad_arrays)
+
                 # Update weights after accumulation steps
                 if (step + 1) % self.gradient_accumulation_steps == 0:
                     # Only update if we have valid gradients
@@ -758,9 +835,25 @@ class LoRATrainer:
                     current_lr = self._get_lr(self.global_step, total_steps)
                     self.optimizer.learning_rate = current_lr
 
-                    # Apply gradients
-                    self.optimizer.update(self.model, accumulated_grads)
+                    # Apply gradients - only update LoRA parameters
+                    # Filter gradients to only include LoRA parameters
+                    lora_grads = self._filter_lora_gradients(accumulated_grads)
+                    self.optimizer.update(self.model, lora_grads)
                     mx.eval(self.model.parameters())
+
+                    # Validate LoRA weights are still finite after update
+                    lora_weights_valid = True
+                    for name, module in self.model.named_modules():
+                        if isinstance(module, LoRALinear):
+                            if not mx.all(mx.isfinite(module.lora_A)).item():
+                                logger.warning(f"NaN detected in lora_A of {name} after update")
+                                lora_weights_valid = False
+                            if not mx.all(mx.isfinite(module.lora_B)).item():
+                                logger.warning(f"NaN detected in lora_B of {name} after update")
+                                lora_weights_valid = False
+
+                    if not lora_weights_valid:
+                        logger.error("LoRA weights became NaN after update. Training may be unstable.")
 
                     # Log progress
                     avg_accumulated_loss = (
@@ -768,12 +861,19 @@ class LoRATrainer:
                     )
 
                     if self.global_step % 10 == 0:
+                        # Count non-zero gradients for diagnostics
+                        lora_grad_count = 0
+                        for name, g in tree_flatten(lora_grads):
+                            if isinstance(g, mx.array) and "lora" in name.lower():
+                                lora_grad_count += 1
+
                         logger.info(
                             f"Epoch {epoch + 1}/{num_epochs}, "
                             f"Step {self.global_step}/{total_steps}, "
                             f"Loss: {avg_accumulated_loss:.4f}, "
                             f"Grad Norm: {grad_norm:.4f}, "
-                            f"LR: {current_lr:.2e}"
+                            f"LR: {current_lr:.2e}, "
+                            f"LoRA grads: {lora_grad_count}"
                         )
 
                     epoch_loss += avg_accumulated_loss
