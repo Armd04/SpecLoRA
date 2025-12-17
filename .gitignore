@@ -65,6 +65,7 @@ ENV/
 # Project specific
 data/failures/*.jsonl
 data/failures/*.json
+data/*.jsonl
 data/checkpoints/
 data/runs/
 data/*.log
