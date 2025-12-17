@@ -87,20 +87,16 @@ class TestLoRAFusion:
         lora_output = lora_layer(x)
         mx.eval(lora_output)
 
-        # Manually fuse weights - use the weight from original_layer inside LoRALinear
-        scaling = lora_layer.alpha / lora_layer.rank
-        delta = (lora_layer.lora_B @ lora_layer.lora_A) * scaling
-        fused_weight = lora_layer.original_layer.weight + delta
+        # Use the LoRALinear's get_fused_weight method
+        fused_weight = lora_layer.get_fused_weight()
+        bias = lora_layer.get_bias()
 
-        # Create fused layer (need to handle bias properly)
-        has_bias = (
-            hasattr(lora_layer.original_layer, "bias")
-            and lora_layer.original_layer.bias is not None
-        )
+        # Create fused layer
+        has_bias = bias is not None
         fused_layer = nn.Linear(16, 32, bias=has_bias)
         fused_layer.weight = fused_weight
         if has_bias:
-            fused_layer.bias = lora_layer.original_layer.bias
+            fused_layer.bias = bias
         mx.eval(fused_layer.parameters())
 
         # Get output from fused layer

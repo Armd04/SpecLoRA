@@ -57,11 +57,15 @@ class LoRALinear(nn.Module):
 
     This dramatically reduces trainable parameters while maintaining
     model capacity for specific tasks.
+
+    Supports both regular nn.Linear and nn.QuantizedLinear layers.
+    For quantized layers, the base weights are dequantized and stored
+    for the forward pass, then can be re-quantized during fusion.
     """
 
     def __init__(
         self,
-        original_layer: nn.Linear,
+        original_layer: nn.Module,
         rank: int = 8,
         alpha: int = 16,
         dropout: float = 0.05,
@@ -70,29 +74,78 @@ class LoRALinear(nn.Module):
         Initialize LoRA adapter.
 
         Args:
-            original_layer: The original linear layer to adapt
+            original_layer: The original linear layer to adapt (Linear or QuantizedLinear)
             rank: LoRA rank (lower = fewer params, less capacity)
             alpha: LoRA alpha for scaling
             dropout: Dropout rate for regularization
         """
         super().__init__()
 
-        self.original_layer = original_layer
         self.rank = rank
         self.alpha = alpha
         self.scaling = alpha / rank
-
-        in_features = original_layer.weight.shape[1]
-        out_features = original_layer.weight.shape[0]
-
-        # LoRA matrices: A projects down, B projects up
-        # Initialize A with small random values, B with zeros
-        # This means the adapter starts as identity (no change)
-        self.lora_A = mx.random.normal((rank, in_features)) * 0.01
-        self.lora_B = mx.zeros((out_features, rank))
-
         self.dropout = dropout
         self._training = True
+
+        # Check if the layer is quantized
+        self.is_quantized = hasattr(original_layer, "scales")
+
+        if self.is_quantized:
+            # Dequantize and store as regular weights for training
+            # Store quantization parameters for later re-quantization
+            self.quant_group_size = original_layer.group_size
+            self.quant_bits = original_layer.bits
+
+            # Dequantize the weights
+            weight = mx.dequantize(
+                original_layer.weight,
+                original_layer.scales,
+                original_layer.biases,
+                original_layer.group_size,
+                original_layer.bits,
+            )
+            self.weight_dtype = original_layer.scales.dtype
+
+            # Store dequantized weight as frozen (we won't update it directly)
+            # Use mx.stop_gradient to prevent gradient flow through base weights
+            self._frozen_weight = mx.stop_gradient(weight)
+
+            # Handle bias
+            self._has_bias = hasattr(original_layer, "bias") and original_layer.bias is not None
+            if self._has_bias:
+                self._frozen_bias = mx.stop_gradient(original_layer.bias)
+            else:
+                self._frozen_bias = None
+
+            in_features = weight.shape[1]
+            out_features = weight.shape[0]
+        else:
+            # Regular linear layer - extract and freeze weights
+            # Don't store original_layer as submodule to prevent gradient flow
+            self.quant_group_size = None
+            self.quant_bits = None
+            self.weight_dtype = original_layer.weight.dtype
+
+            # Store frozen weights (use stop_gradient to prevent gradient flow)
+            self._frozen_weight = mx.stop_gradient(original_layer.weight)
+
+            self._has_bias = hasattr(original_layer, "bias") and original_layer.bias is not None
+            if self._has_bias:
+                self._frozen_bias = mx.stop_gradient(original_layer.bias)
+            else:
+                self._frozen_bias = None
+
+            in_features = original_layer.weight.shape[1]
+            out_features = original_layer.weight.shape[0]
+
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # LoRA matrices: A projects down, B projects up
+        # Initialize A with small random values scaled by 1/sqrt(rank)
+        # Initialize B with zeros so adapter starts as identity (no change)
+        self.lora_A = mx.random.normal((rank, in_features)) * (1.0 / math.sqrt(rank))
+        self.lora_B = mx.zeros((out_features, rank))
 
     def __call__(self, x: mx.array) -> mx.array:
         """
@@ -104,10 +157,13 @@ class LoRALinear(nn.Module):
         Returns:
             Output with LoRA adaptation applied
         """
-        # Original layer output
-        original_output = self.original_layer(x)
+        # Base layer computation using frozen weights (no gradients flow through these)
+        original_output = x @ self._frozen_weight.T
+        if self._frozen_bias is not None:
+            original_output = original_output + self._frozen_bias
 
         # LoRA adaptation: x @ A.T @ B.T * scaling
+        # Gradients only flow through lora_A and lora_B
         if self._training and self.dropout > 0:
             # Apply dropout during training
             mask = mx.random.bernoulli(1 - self.dropout, x.shape)
@@ -118,22 +174,19 @@ class LoRALinear(nn.Module):
 
         return original_output + lora_output * self.scaling
 
-    def merge_weights(self) -> None:
+    def get_fused_weight(self) -> mx.array:
         """
-        Merge LoRA weights into the original layer.
+        Get the fused weight (base + LoRA delta).
 
-        This is useful for inference when you want to use the adapted
-        model without LoRA overhead.
+        Returns:
+            Fused weight matrix
         """
-        delta_w = (self.lora_B @ self.lora_A) * self.scaling
-        self.original_layer.weight = self.original_layer.weight + delta_w
+        delta = (self.lora_B @ self.lora_A) * self.scaling
+        return self._frozen_weight + delta.astype(self.weight_dtype)
 
-    def parameters(self) -> Dict[str, mx.array]:
-        """Return only the trainable LoRA parameters."""
-        return {
-            "lora_A": self.lora_A,
-            "lora_B": self.lora_B,
-        }
+    def get_bias(self) -> Optional[mx.array]:
+        """Get the bias if present."""
+        return self._frozen_bias
 
 
 def apply_lora_to_model(
@@ -143,6 +196,10 @@ def apply_lora_to_model(
     """
     Apply LoRA adapters to specified layers in the model.
 
+    Supports both regular Linear and QuantizedLinear layers.
+    For QuantizedLinear, the weights are dequantized for training,
+    then can be re-quantized during fusion.
+
     Args:
         model: The model to adapt
         config: LoRA configuration
@@ -150,6 +207,7 @@ def apply_lora_to_model(
     Returns:
         Model with LoRA adapters applied
     """
+    applied_layers = []
 
     def apply_lora_recursive(module: nn.Module, path: str = "") -> None:
         """Recursively apply LoRA to matching layers."""
@@ -159,7 +217,11 @@ def apply_lora_to_model(
             # Check if this is a target module
             is_target = any(target in name for target in config.target_modules)
 
-            if is_target and isinstance(child, nn.Linear):
+            # Support both Linear and QuantizedLinear
+            is_linear = isinstance(child, nn.Linear)
+            is_quantized_linear = isinstance(child, nn.QuantizedLinear)
+
+            if is_target and (is_linear or is_quantized_linear):
                 # Replace with LoRA-wrapped version
                 lora_layer = LoRALinear(
                     child,
@@ -175,7 +237,9 @@ def apply_lora_to_model(
                     parent = getattr(parent, part)
                 setattr(parent, parts[-1], lora_layer)
 
-                logger.debug(f"Applied LoRA to: {full_path}")
+                layer_type = "QuantizedLinear" if is_quantized_linear else "Linear"
+                logger.debug(f"Applied LoRA to {layer_type}: {full_path}")
+                applied_layers.append(full_path)
 
     # Count original parameters
     original_params = 0
@@ -188,16 +252,29 @@ def apply_lora_to_model(
 
     apply_lora_recursive(model)
 
+    # Force evaluation of new LoRA parameters
+    mx.eval(model.parameters())
+
     # Count LoRA parameters
     lora_params = 0
+    lora_layer_count = 0
     for _, module in model.named_modules():
         if isinstance(module, LoRALinear):
             lora_params += module.lora_A.size + module.lora_B.size
+            lora_layer_count += 1
 
-    logger.info(
-        f"LoRA applied. Original params: {original_params / 1e6:.1f}M, "
-        f"LoRA params: {lora_params / 1e6:.2f}M ({100 * lora_params / original_params:.2f}%)"
-    )
+    if lora_layer_count == 0:
+        logger.warning(
+            f"No LoRA layers were applied! Target modules: {config.target_modules}. "
+            "Check that target module names match layer names in the model."
+        )
+    else:
+        logger.info(
+            f"LoRA applied to {lora_layer_count} layers. "
+            f"Original params: {original_params / 1e6:.1f}M, "
+            f"LoRA params: {lora_params / 1e6:.2f}M "
+            f"({100 * lora_params / max(1, original_params):.2f}%)"
+        )
 
     return model
 
@@ -313,12 +390,19 @@ class LoRATrainer:
         Returns:
             Learning rate for this step
         """
+        if self.warmup_steps <= 0:
+            # No warmup, use constant LR with cosine decay
+            progress = step / max(1, total_steps)
+            return self.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
+
         if step < self.warmup_steps:
-            # Linear warmup
-            return self.learning_rate * step / self.warmup_steps
+            # Linear warmup - start from small fraction, not zero
+            # Use (step + 1) to avoid zero LR at step 0
+            return self.learning_rate * (step + 1) / self.warmup_steps
         else:
-            # Cosine decay
-            progress = (step - self.warmup_steps) / (total_steps - self.warmup_steps)
+            # Cosine decay after warmup
+            decay_steps = max(1, total_steps - self.warmup_steps)
+            progress = (step - self.warmup_steps) / decay_steps
             return self.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
 
     def _prepare_batch(
@@ -897,9 +981,9 @@ class LoRATrainer:
 
         return self.model
 
-    def _fuse_lora_linear(self, lora_layer: LoRALinear) -> nn.Linear:
+    def _fuse_lora_linear(self, lora_layer: LoRALinear) -> nn.Module:
         """
-        Fuse a single LoRALinear layer into a clean nn.Linear.
+        Fuse a single LoRALinear layer into a clean nn.Linear or nn.QuantizedLinear.
 
         Handles both quantized and non-quantized layers.
 
@@ -909,36 +993,10 @@ class LoRATrainer:
         Returns:
             nn.Linear or nn.QuantizedLinear: Clean linear layer with fused weights
         """
-        original = lora_layer.original_layer
-
-        # Check if it's a quantized layer
-        is_quantized = hasattr(original, "scales")
-
-        if is_quantized:
-            # Dequantize first for fusion
-            weight = mx.dequantize(
-                original.weight,
-                original.scales,
-                original.biases,
-                original.group_size,
-                original.bits,
-            )
-            dtype = original.scales.dtype
-        else:
-            weight = original.weight
-            dtype = weight.dtype
-
-        # Compute LoRA delta: (B @ A) * scaling
-        # lora_B is (out_features, rank), lora_A is (rank, in_features)
-        # Result is (out_features, in_features)
-        delta = (lora_layer.lora_B @ lora_layer.lora_A) * lora_layer.scaling
-        delta = delta.astype(dtype)
-
-        # Create fused weight
-        fused_weight = weight + delta
-
-        # Check for bias
-        has_bias = hasattr(original, "bias") and original.bias is not None
+        # Get fused weight using the LoRALinear's method
+        fused_weight = lora_layer.get_fused_weight()
+        bias = lora_layer.get_bias()
+        has_bias = bias is not None
 
         # Create clean linear layer
         out_features, in_features = fused_weight.shape
@@ -946,14 +1004,14 @@ class LoRATrainer:
         fused_linear.weight = fused_weight
 
         if has_bias:
-            fused_linear.bias = original.bias
+            fused_linear.bias = bias
 
         # Re-quantize if original was quantized
-        if is_quantized:
+        if lora_layer.is_quantized:
             fused_linear = nn.QuantizedLinear.from_linear(
                 fused_linear,
-                original.group_size,
-                original.bits,
+                lora_layer.quant_group_size,
+                lora_layer.quant_bits,
             )
 
         return fused_linear
