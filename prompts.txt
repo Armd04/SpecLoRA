@@ -1,0 +1,78 @@
+# SpecLoRA Training Prompts - Data Structures, Algorithms, ML/AI, Theory
+# Moderate-to-hard difficulty, Python-focused with C++ and Rust mix
+
+# Data Structures & Algorithms - Python
+
+Implement an LRU cache in Python with O(1) get and put operations using a hashmap and doubly linked list.
+
+Write a function to detect a cycle in a directed graph using DFS and explain the time complexity.
+
+Implement the Knapsack problem using dynamic programming with memoization. Include both top-down and bottom-up approaches.
+
+Given a binary tree, write a function to find the lowest common ancestor of two nodes without using extra space for parent pointers.
+
+Implement Dijkstra's algorithm for finding shortest paths in a weighted graph. Handle negative weights appropriately.
+
+Write a function to merge K sorted linked lists efficiently. What's the optimal time complexity?
+
+Implement a Trie data structure with insert, search, and prefix matching. Then use it to solve autocomplete.
+
+Find the longest increasing subsequence in an array. Optimize beyond the naive O(n^2) solution.
+
+# String & Pattern Matching
+
+Implement the KMP string matching algorithm and explain why it's more efficient than naive matching.
+
+Write a function to find all anagrams of a pattern in a text string using sliding window technique.
+
+# Graph Algorithms
+
+Implement Kruskal's algorithm for finding minimum spanning tree using Union-Find with path compression.
+
+Detect if a graph is bipartite using BFS coloring. What makes a graph non-bipartite?
+
+# ML/AI Concepts - Theory & Implementation
+
+Explain backpropagation in neural networks with the chain rule. Include the mathematical derivation for a 2-layer network.
+
+Implement gradient descent from scratch in Python with momentum and learning rate decay. Why does momentum help?
+
+What is the vanishing gradient problem? Explain why ReLU activation helps mitigate it compared to sigmoid.
+
+Implement a simple transformer attention mechanism in Python. Explain scaled dot-product attention and why we scale by sqrt(d_k).
+
+Compare Adam, RMSprop, and SGD optimizers. When would you choose each one and why?
+
+Explain the bias-variance tradeoff. How does regularization (L1 vs L2) affect this tradeoff?
+
+What is batch normalization and why does it help training? Implement a simplified version for a dense layer.
+
+# Algorithmic Theory & Complexity
+
+Prove that the Traveling Salesman Problem is NP-complete using a reduction from Hamiltonian Cycle.
+
+Analyze the time and space complexity of merge sort vs quicksort. When does quicksort degrade to O(n^2)?
+
+Explain the Master Theorem for solving recurrence relations. Apply it to T(n) = 2T(n/2) + n*log(n).
+
+What is amortized analysis? Explain using dynamic array resizing as an example with the accounting method.
+
+# C++ Implementations
+
+Write a C++ template function for a thread-safe singleton pattern using std::call_once. Why is the naive double-checked locking broken?
+
+Implement a memory pool allocator in C++ to reduce heap fragmentation. Compare performance with standard new/delete.
+
+# Rust Implementations
+
+Implement a thread-safe reference-counted smart pointer in Rust similar to Arc. Explain the memory ordering semantics.
+
+Write a Rust function that uses lifetimes to safely return a reference to the longest string slice from two inputs.
+
+Explain Rust's ownership system and how it prevents data races at compile time. Compare with C++ shared_ptr.
+
+# Advanced/Mixed
+
+Debug this buggy Python implementation of binary search: def search(arr, x): l, r = 0, len(arr); while l < r: mid = (l+r)//2; if arr[mid] == x: return mid; elif arr[mid] < x: l = mid; else: r = mid; return -1
+
+Implement parallel merge sort using Python's multiprocessing. What's the theoretical speedup on P processors?

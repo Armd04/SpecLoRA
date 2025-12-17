@@ -14,6 +14,7 @@ Usage:
 """
 
 import logging
+import random
 import sys
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -938,7 +939,14 @@ def benchmark(ctx, prompt, iterations, max_tokens, implementation):
     multiple=True,
     help="Prompts to process (can specify multiple times)",
 )
-@click.option("--max-tokens", "-m", default=256, help="Maximum tokens per generation")
+@click.option("--max-tokens", "-m", default=4096, help="Maximum tokens per generation")
+@click.option(
+    "--limit",
+    "-l",
+    type=int,
+    default=None,
+    help="Maximum number of prompts to process (limits total prompts from all sources)",
+)
 @click.option(
     "--output",
     "-o",
@@ -946,7 +954,7 @@ def benchmark(ctx, prompt, iterations, max_tokens, implementation):
     help="Output file for detailed results (JSONL format)",
 )
 @click.pass_context
-def collect_data(ctx, prompts_file, prompts, max_tokens, output):
+def collect_data(ctx, prompts_file, prompts, max_tokens, limit, output):
     """Collect token-level training data using manual speculative decoding.
 
     This command runs manual speculative decoding on a batch of prompts
@@ -963,6 +971,9 @@ def collect_data(ctx, prompts_file, prompts, max_tokens, output):
 
         # With output file
         python -m src.main collect-data -f prompts.txt -o data/detailed.jsonl
+
+        # Limit number of prompts processed
+        python -m src.main collect-data -f prompts.txt --limit 10
     """
     # Collect prompts from all sources
     all_prompts = list(prompts)
@@ -979,6 +990,16 @@ def collect_data(ctx, prompts_file, prompts, max_tokens, output):
             "[red]Error: No prompts provided. Use --prompts-file or --prompts[/red]"
         )
         return
+
+    # Apply limit if specified (randomly sample if limiting)
+    original_count = len(all_prompts)
+    if limit is not None and limit > 0:
+        if limit < original_count:
+            all_prompts = random.sample(all_prompts, limit)
+            console.print(
+                f"[yellow]Randomly sampled {limit} prompts (from {original_count} total)[/yellow]"
+            )
+        # If limit >= original_count, use all prompts (no need to sample)
 
     console.print(
         Panel(
