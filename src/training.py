@@ -231,11 +231,22 @@ def apply_lora_to_model(
                 )
 
                 # Set the layer in the parent module
+                # Handle both attribute access and list indexing
                 parent = module
                 parts = name.split(".")
                 for part in parts[:-1]:
-                    parent = getattr(parent, part)
-                setattr(parent, parts[-1], lora_layer)
+                    if part.isdigit():
+                        # Handle list indexing (e.g., layers.23 -> layers[23])
+                        parent = parent[int(part)]
+                    else:
+                        parent = getattr(parent, part)
+
+                # Set the final layer
+                final_part = parts[-1]
+                if final_part.isdigit():
+                    parent[int(final_part)] = lora_layer
+                else:
+                    setattr(parent, final_part, lora_layer)
 
                 layer_type = "QuantizedLinear" if is_quantized_linear else "Linear"
                 logger.debug(f"Applied LoRA to {layer_type}: {full_path}")
