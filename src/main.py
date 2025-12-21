@@ -213,6 +213,7 @@ class SpeculativeDecodingSystem:
                 except Exception as e:
                     logger.warning(f"Could not calculate prompt length: {e}")
                     prompt_length = None
+                    prompt_tokens = None
 
                 should_train = self.data_collector.add_detailed_result(
                     prompt=prompt,
@@ -226,6 +227,7 @@ class SpeculativeDecodingSystem:
                         "verify_time": result.metrics.verify_time_seconds,
                     },
                     prompt_length=prompt_length,
+                    prompt_tokens=prompt_tokens,
                 )
 
                 if should_train:
@@ -378,6 +380,7 @@ class SpeculativeDecodingSystem:
 
                 # Calculate prompt length for accurate disagreement position mapping
                 prompt_length = None
+                prompt_tokens = None
                 try:
                     formatted_prompt = manual_decoder.format_prompt(prompt)
                     prompt_tokens = manual_decoder.tokenizer.encode(formatted_prompt)
@@ -392,6 +395,7 @@ class SpeculativeDecodingSystem:
                     disagreements=result.disagreements,
                     acceptance_rate=result.metrics.acceptance_rate,
                     prompt_length=prompt_length,
+                    prompt_tokens=prompt_tokens,
                 )
 
                 # Track aggregate stats
@@ -515,7 +519,27 @@ class SpeculativeDecodingSystem:
         )
 
         # Get draft model
-        draft_model, tokenizer = self.model_manager.get_draft_model()
+        draft_model, draft_tokenizer = self.model_manager.get_draft_model()
+        # IMPORTANT: Training data collection uses the decoder tokenizer (target tokenizer).
+        # If draft/target tokenizers differ, the token IDs in failure cases may be invalid
+        # for the draft model (leading to NaNs or undefined behavior). Prefer the decoder's
+        # tokenizer for training, and hard-fail on obvious incompatibility.
+        tokenizer = self.decoder.tokenizer
+        try:
+            if (
+                hasattr(draft_tokenizer, "vocab_size")
+                and hasattr(tokenizer, "vocab_size")
+                and draft_tokenizer.vocab_size != tokenizer.vocab_size
+            ):
+                raise RuntimeError(
+                    "Draft/target tokenizers have different vocab_size "
+                    f"({draft_tokenizer.vocab_size} vs {tokenizer.vocab_size}). "
+                    "Collected token IDs may not be valid for the draft model; aborting training."
+                )
+        except Exception as e:
+            # If tokenizer objects don't expose vocab_size cleanly, we still proceed,
+            # but training will additionally validate token ID ranges per example.
+            logger.warning(f"Tokenizer compatibility check failed: {e}")
 
         # Initialize trainer
         trainer = LoRATrainer(

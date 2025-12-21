@@ -78,6 +78,13 @@ class TrainingExample:
     # Original prompt
     prompt: str
 
+    # Tokenized prompt as used during generation (preferred for training).
+    # When present, this should be the token IDs of the FULL formatted chat prompt
+    # (i.e., after tokenizer.apply_chat_template(..., add_generation_prompt=True)).
+    #
+    # Storing prompt_tokens avoids tokenizer/template drift between collection and training.
+    prompt_tokens: Optional[List[int]] = None
+
     # What the draft model generated
     draft_output: List[int]
 
@@ -228,6 +235,7 @@ class DataCollector:
         example = TrainingExample(
             id=self._generate_id(),
             prompt=result.prompt,
+            prompt_tokens=getattr(result, "prompt_tokens", None),
             draft_output=result.draft_outputs or result.tokens,
             target_output=result.target_outputs or result.tokens,
             acceptance_rate=result.metrics.acceptance_rate,
@@ -453,6 +461,7 @@ class DataCollector:
         acceptance_rate: float,
         metadata: Optional[Dict[str, Any]] = None,
         prompt_length: Optional[int] = None,
+        prompt_tokens: Optional[List[int]] = None,
     ) -> bool:
         """
         Add a result from manual speculative decoding with token-level details.
@@ -507,6 +516,7 @@ class DataCollector:
         example = TrainingExample(
             id=self._generate_id(),
             prompt=prompt,
+            prompt_tokens=prompt_tokens,
             draft_output=draft_output,  # Draft's original predictions
             target_output=generated_tokens,  # Final output (target's choices)
             acceptance_rate=acceptance_rate,

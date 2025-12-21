@@ -101,6 +101,11 @@ class SpeculativeResult:
     # Input prompt (for failure case collection)
     prompt: str
 
+    # Tokenized prompt as used during generation (formatted chat prompt tokens).
+    # This is critical for training correctness; when present, training should
+    # use these tokens instead of re-encoding the raw user prompt.
+    prompt_tokens: Optional[List[int]] = None
+
     # Whether this is considered a "failure" case (low acceptance)
     is_failure_case: bool = False
 
@@ -241,6 +246,9 @@ class SpeculativeDecoder:
 
         # Format prompt using the appropriate chat template
         formatted_prompt = self._format_prompt(prompt)
+        # Pre-tokenize the formatted prompt so training can exactly reproduce context
+        # (avoids tokenizer/template drift and raw-prompt mismatches).
+        prompt_tokens = self.tokenizer.encode(formatted_prompt)
 
         # Create sampler with temperature and top_p
         sampler = self._create_sampler()
@@ -285,6 +293,7 @@ class SpeculativeDecoder:
             metrics=metrics,
             prompt=prompt,
             is_failure_case=is_failure,
+            prompt_tokens=prompt_tokens,
             draft_outputs=draft_all_outputs,
             target_outputs=target_all_outputs,
         )

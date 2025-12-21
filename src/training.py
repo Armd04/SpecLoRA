@@ -462,8 +462,14 @@ class LoRATrainer:
         target_ids_list = []
 
         for ex in examples:
-            # Encode prompt
-            prompt_ids = self.tokenizer.encode(ex.prompt)
+            # Prefer the exact prompt tokens used during generation (formatted chat prompt).
+            # This avoids mismatch between "raw user prompt" and "chat-templated prompt",
+            # and prevents tokenizer/template drift causing invalid training batches.
+            if getattr(ex, "prompt_tokens", None):
+                prompt_ids = list(ex.prompt_tokens)
+            else:
+                # Backward-compat: older datasets only store raw prompt text.
+                prompt_ids = self.tokenizer.encode(ex.prompt)
             prompt_len = len(prompt_ids)
 
             # Target tokens are what the target model generated (not including prompt)
@@ -516,6 +522,39 @@ class LoRATrainer:
             # But DO NOT mask position prompt_len-1, which is the critical prompt→generation transition
             for i in range(prompt_len - 1):
                 targets[i] = -100
+
+            # Safety: ensure there is at least one supervised target token.
+            # If not, skip this example rather than producing a NaN loss later.
+            num_valid_local = sum(1 for t in targets if t != -100)
+            if num_valid_local == 0:
+                logger.warning(
+                    f"Skipping example {ex.id}: no valid target labels after masking "
+                    f"(prompt_len={prompt_len}, target_len={len(target_tokens)})"
+                )
+                continue
+
+            # Safety: validate token ID ranges to avoid undefined behavior / NaNs
+            # if training data was collected with a different tokenizer.
+            vocab_size = getattr(self.tokenizer, "vocab_size", None)
+            if isinstance(vocab_size, int) and vocab_size > 0:
+                max_input = max(full_input) if full_input else -1
+                min_input = min(full_input) if full_input else 0
+                # Only consider non-masked targets
+                valid_targets = [t for t in targets if t != -100]
+                max_tgt = max(valid_targets) if valid_targets else -1
+                min_tgt = min(valid_targets) if valid_targets else 0
+                if (
+                    min_input < 0
+                    or max_input >= vocab_size
+                    or min_tgt < 0
+                    or max_tgt >= vocab_size
+                ):
+                    logger.warning(
+                        f"Skipping example {ex.id}: token id out of range for vocab_size={vocab_size} "
+                        f"(input min/max={min_input}/{max_input}, target min/max={min_tgt}/{max_tgt}). "
+                        "This usually indicates a tokenizer mismatch between data collection and training."
+                    )
+                    continue
 
             # Verify lengths match
             assert len(full_input) == len(targets), (
