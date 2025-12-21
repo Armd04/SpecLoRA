@@ -526,14 +526,25 @@ class SpeculativeDecodingSystem:
         # tokenizer for training, and hard-fail on obvious incompatibility.
         tokenizer = self.decoder.tokenizer
         try:
+            # Prefer len(tokenizer) over vocab_size because many tokenizers exclude
+            # added/special tokens from vocab_size but still emit IDs >= vocab_size.
+            def _effective_size(tok):
+                try:
+                    return int(len(tok))
+                except Exception:
+                    vs = getattr(tok, "vocab_size", None)
+                    return int(vs) if vs is not None else None
+
+            draft_sz = _effective_size(draft_tokenizer)
+            target_sz = _effective_size(tokenizer)
             if (
-                hasattr(draft_tokenizer, "vocab_size")
-                and hasattr(tokenizer, "vocab_size")
-                and draft_tokenizer.vocab_size != tokenizer.vocab_size
+                isinstance(draft_sz, int)
+                and isinstance(target_sz, int)
+                and draft_sz != target_sz
             ):
                 raise RuntimeError(
-                    "Draft/target tokenizers have different vocab_size "
-                    f"({draft_tokenizer.vocab_size} vs {tokenizer.vocab_size}). "
+                    "Draft/target tokenizers have different effective vocab sizes "
+                    f"({draft_sz} vs {target_sz}). "
                     "Collected token IDs may not be valid for the draft model; aborting training."
                 )
         except Exception as e:

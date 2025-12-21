@@ -403,6 +403,33 @@ class LoRATrainer:
         self.global_step = 0
         self.best_loss = float("inf")
 
+        # Best-effort "effective vocab size" for sanity-checking token IDs.
+        # NOTE: Some tokenizers report vocab_size excluding added/special tokens,
+        # while token IDs may legitimately exceed tokenizer.vocab_size-1.
+        # We therefore prefer len(tokenizer) when available.
+        self._tokenizer_effective_vocab_size: Optional[int] = None
+        try:
+            self._tokenizer_effective_vocab_size = int(len(self.tokenizer))
+        except Exception:
+            try:
+                vs = getattr(self.tokenizer, "vocab_size", None)
+                self._tokenizer_effective_vocab_size = int(vs) if vs is not None else None
+            except Exception:
+                self._tokenizer_effective_vocab_size = None
+
+        # Model output vocab size (authoritative if we can infer it).
+        # We try to infer it from an embedding table or similar attribute, otherwise
+        # we will only rely on tokenizer-based checks.
+        self._model_vocab_size: Optional[int] = None
+        for attr in ("vocab_size", "n_vocab", "n_words"):
+            try:
+                val = getattr(self.model, attr, None)
+                if isinstance(val, int) and val > 0:
+                    self._model_vocab_size = val
+                    break
+            except Exception:
+                continue
+
     def _get_lr(self, step: int, total_steps: int) -> float:
         """
         Get learning rate with warmup and cosine decay.
@@ -535,8 +562,8 @@ class LoRATrainer:
 
             # Safety: validate token ID ranges to avoid undefined behavior / NaNs
             # if training data was collected with a different tokenizer.
-            vocab_size = getattr(self.tokenizer, "vocab_size", None)
-            if isinstance(vocab_size, int) and vocab_size > 0:
+            vocab_limit = self._model_vocab_size or self._tokenizer_effective_vocab_size
+            if isinstance(vocab_limit, int) and vocab_limit > 0:
                 max_input = max(full_input) if full_input else -1
                 min_input = min(full_input) if full_input else 0
                 # Only consider non-masked targets
@@ -545,12 +572,12 @@ class LoRATrainer:
                 min_tgt = min(valid_targets) if valid_targets else 0
                 if (
                     min_input < 0
-                    or max_input >= vocab_size
+                    or max_input >= vocab_limit
                     or min_tgt < 0
-                    or max_tgt >= vocab_size
+                    or max_tgt >= vocab_limit
                 ):
                     logger.warning(
-                        f"Skipping example {ex.id}: token id out of range for vocab_size={vocab_size} "
+                        f"Skipping example {ex.id}: token id out of range for vocab_limit={vocab_limit} "
                         f"(input min/max={min_input}/{max_input}, target min/max={min_tgt}/{max_tgt}). "
                         "This usually indicates a tokenizer mismatch between data collection and training."
                     )
