@@ -83,8 +83,6 @@ class TrainingExample:
     # (i.e., after tokenizer.apply_chat_template(..., add_generation_prompt=True)).
     #
     # Storing prompt_tokens avoids tokenizer/template drift between collection and training.
-    prompt_tokens: Optional[List[int]] = None
-
     # What the draft model generated
     draft_output: List[int]
 
@@ -96,6 +94,13 @@ class TrainingExample:
 
     # Timestamp
     timestamp: str
+
+    # Tokenized prompt as used during generation (preferred for training).
+    # When present, this should be the token IDs of the FULL formatted chat prompt
+    # (i.e., after tokenizer.apply_chat_template(..., add_generation_prompt=True)).
+    #
+    # Storing prompt_tokens avoids tokenizer/template drift between collection and training.
+    prompt_tokens: Optional[List[int]] = None
 
     # Whether this is a failure case or replay case
     is_failure: bool = True

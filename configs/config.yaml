@@ -10,8 +10,8 @@ models:
     
   # Draft model (smaller, trainable)
   draft:
-    name: "mlx-community/Qwen2.5-0.5B-Instruct-4bit"  # Quantized for lower memory
-    # name: "mlx-community/Qwen2.5-0.5B-Instruct-bf16"  # BF16 alternative
+    # name: "mlx-community/Qwen2.5-0.5B-Instruct-4bit"  # Quantized for lower memory
+    name: "mlx-community/Qwen2.5-0.5B-Instruct-bf16"  # BF16 alternative
     # name: "mlx-community/Qwen2.5-1.5B-Instruct-4bit"  # Larger draft model
 
 # Chat Formatting
@@ -49,19 +49,21 @@ training:
       - "v_proj"
   
   # Training parameters
-  learning_rate: 5.0e-5  # Lower learning rate for stability
+  # Tuned for small datasets (~30 prompts): lower LR, fewer epochs, smaller warmup
+  learning_rate: 1.0e-5
   batch_size: 1
-  gradient_accumulation_steps: 4
-  num_epochs: 3
-  warmup_steps: 20  # Longer warmup for stability
+  gradient_accumulation_steps: 2
+  num_epochs: 2
+  warmup_steps: 5
   
   # When to trigger training
-  min_failure_cases: 10
+  # Require more signal before training when datasets are small
+  min_failure_cases: 30
   max_failure_cases: 100
   
   # Replay buffer for successful cases (prevents catastrophic forgetting)
   replay_buffer_size: 25
-  replay_ratio: 0.2  # 20% of training batch is replay samples
+  replay_ratio: 0.3  # Slightly higher replay to stabilize small runs
   
   # Checkpointing
   save_every_n_steps: 50

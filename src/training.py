@@ -111,7 +111,9 @@ class LoRALinear(nn.Module):
             object.__setattr__(self, "_frozen_weight", weight)
 
             # Handle bias
-            self._has_bias = hasattr(original_layer, "bias") and original_layer.bias is not None
+            self._has_bias = (
+                hasattr(original_layer, "bias") and original_layer.bias is not None
+            )
             if self._has_bias:
                 object.__setattr__(self, "_frozen_bias", original_layer.bias)
             else:
@@ -129,7 +131,9 @@ class LoRALinear(nn.Module):
             # MLX's parameter tracking so these won't be included in parameters()
             object.__setattr__(self, "_frozen_weight", original_layer.weight)
 
-            self._has_bias = hasattr(original_layer, "bias") and original_layer.bias is not None
+            self._has_bias = (
+                hasattr(original_layer, "bias") and original_layer.bias is not None
+            )
             if self._has_bias:
                 object.__setattr__(self, "_frozen_bias", original_layer.bias)
             else:
@@ -391,6 +395,71 @@ class LoRATrainer:
         lora_param_count = sum(p.size for p in self.trainable_params.values())
         logger.info(f"Trainable LoRA parameters: {lora_param_count:,}")
 
+        # Best-effort "effective vocab size" for sanity-checking token IDs.
+        # NOTE: Some tokenizers report vocab_size excluding added/special tokens,
+        # while token IDs may legitimately exceed tokenizer.vocab_size-1.
+        # We therefore prefer len(tokenizer) when available.
+        self._tokenizer_effective_vocab_size: Optional[int] = None
+        try:
+            self._tokenizer_effective_vocab_size = int(len(self.tokenizer))
+        except Exception:
+            try:
+                vs = getattr(self.tokenizer, "vocab_size", None)
+                self._tokenizer_effective_vocab_size = (
+                    int(vs) if vs is not None else None
+                )
+            except Exception:
+                self._tokenizer_effective_vocab_size = None
+
+        # Model output vocab size (authoritative if we can infer it).
+        # We try to infer it from an embedding table or similar attribute, otherwise
+        # we will only rely on tokenizer-based checks.
+        self._model_vocab_size: Optional[int] = None
+
+        # Priority 1: Check embedding layer directly (most reliable)
+        try:
+            if hasattr(self.model, "model") and hasattr(
+                self.model.model, "embed_tokens"
+            ):
+                embed_size = self.model.model.embed_tokens.weight.shape[0]
+                self._model_vocab_size = int(embed_size)
+            elif hasattr(self.model, "embed_tokens"):
+                embed_size = self.model.embed_tokens.weight.shape[0]
+                self._model_vocab_size = int(embed_size)
+        except Exception:
+            pass
+
+        # Priority 2: Check model config attributes
+        if self._model_vocab_size is None:
+            for attr in ("vocab_size", "n_vocab", "n_words"):
+                try:
+                    val = getattr(self.model, attr, None)
+                    if isinstance(val, int) and val > 0:
+                        self._model_vocab_size = val
+                        break
+                except Exception:
+                    continue
+
+        # Priority 3: Check model.args or model.config
+        if self._model_vocab_size is None:
+            try:
+                if hasattr(self.model, "args") and hasattr(
+                    self.model.args, "vocab_size"
+                ):
+                    self._model_vocab_size = int(self.model.args.vocab_size)
+                elif hasattr(self.model, "config") and hasattr(
+                    self.model.config, "vocab_size"
+                ):
+                    self._model_vocab_size = int(self.model.config.vocab_size)
+            except Exception:
+                pass
+
+        # Log detected vocab sizes for debugging tokenizer mismatches
+        logger.debug(
+            f"Vocab size detection: model={self._model_vocab_size}, "
+            f"tokenizer_effective={self._tokenizer_effective_vocab_size}"
+        )
+
         # Setup optimizer (AdamW works well for LoRA)
         # Use lower weight decay for stability
         self.optimizer = optim.AdamW(
@@ -402,33 +471,6 @@ class LoRATrainer:
 
         self.global_step = 0
         self.best_loss = float("inf")
-
-        # Best-effort "effective vocab size" for sanity-checking token IDs.
-        # NOTE: Some tokenizers report vocab_size excluding added/special tokens,
-        # while token IDs may legitimately exceed tokenizer.vocab_size-1.
-        # We therefore prefer len(tokenizer) when available.
-        self._tokenizer_effective_vocab_size: Optional[int] = None
-        try:
-            self._tokenizer_effective_vocab_size = int(len(self.tokenizer))
-        except Exception:
-            try:
-                vs = getattr(self.tokenizer, "vocab_size", None)
-                self._tokenizer_effective_vocab_size = int(vs) if vs is not None else None
-            except Exception:
-                self._tokenizer_effective_vocab_size = None
-
-        # Model output vocab size (authoritative if we can infer it).
-        # We try to infer it from an embedding table or similar attribute, otherwise
-        # we will only rely on tokenizer-based checks.
-        self._model_vocab_size: Optional[int] = None
-        for attr in ("vocab_size", "n_vocab", "n_words"):
-            try:
-                val = getattr(self.model, attr, None)
-                if isinstance(val, int) and val > 0:
-                    self._model_vocab_size = val
-                    break
-            except Exception:
-                continue
 
     def _get_lr(self, step: int, total_steps: int) -> float:
         """
@@ -562,6 +604,7 @@ class LoRATrainer:
 
             # Safety: validate token ID ranges to avoid undefined behavior / NaNs
             # if training data was collected with a different tokenizer.
+            # Use model vocab size (from embedding layer) as authoritative source.
             vocab_limit = self._model_vocab_size or self._tokenizer_effective_vocab_size
             if isinstance(vocab_limit, int) and vocab_limit > 0:
                 max_input = max(full_input) if full_input else -1
@@ -738,6 +781,7 @@ class LoRATrainer:
         Returns:
             Tuple of (loss_value, gradients)
         """
+
         # Create a loss function that we can differentiate
         def loss_fn(model):
             return self._compute_loss(model, input_ids, target_ids)
@@ -755,7 +799,9 @@ class LoRATrainer:
         if self.global_step == 0:
             grad_names = [name for name, _ in tree_flatten(grads)]
             lora_grads = [n for n in grad_names if "lora" in n.lower()]
-            logger.debug(f"Total gradient entries: {len(grad_names)}, LoRA gradients: {len(lora_grads)}")
+            logger.debug(
+                f"Total gradient entries: {len(grad_names)}, LoRA gradients: {len(lora_grads)}"
+            )
 
         return loss.item(), grads
 
@@ -862,7 +908,11 @@ class LoRATrainer:
                 valid_steps_in_accumulation += 1
 
                 # Force evaluation to prevent computation graph from growing
-                grad_arrays = [v for _, v in tree_flatten(accumulated_grads) if isinstance(v, mx.array)]
+                grad_arrays = [
+                    v
+                    for _, v in tree_flatten(accumulated_grads)
+                    if isinstance(v, mx.array)
+                ]
                 if grad_arrays:
                     mx.eval(*grad_arrays)
 
@@ -912,14 +962,20 @@ class LoRATrainer:
                     for name, module in self.model.named_modules():
                         if isinstance(module, LoRALinear):
                             if not mx.all(mx.isfinite(module.lora_A)).item():
-                                logger.warning(f"NaN detected in lora_A of {name} after update")
+                                logger.warning(
+                                    f"NaN detected in lora_A of {name} after update"
+                                )
                                 lora_weights_valid = False
                             if not mx.all(mx.isfinite(module.lora_B)).item():
-                                logger.warning(f"NaN detected in lora_B of {name} after update")
+                                logger.warning(
+                                    f"NaN detected in lora_B of {name} after update"
+                                )
                                 lora_weights_valid = False
 
                     if not lora_weights_valid:
-                        logger.error("LoRA weights became NaN after update. Training may be unstable.")
+                        logger.error(
+                            "LoRA weights became NaN after update. Training may be unstable."
+                        )
 
                     # Log progress
                     avg_accumulated_loss = (
