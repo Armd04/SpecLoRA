@@ -202,10 +202,16 @@ class ModelManager:
                 parts = layer_path.split(".")
                 module = self.draft_model
                 for part in parts[:-1]:
-                    module = getattr(module, part)
+                    if part.isdigit():  # List index
+                        module = module[int(part)]
+                    else:  # Attribute
+                        module = getattr(module, part)
                 layer_name = parts[-1]
-                layer = getattr(module, layer_name)
-            except AttributeError as e:
+                if layer_name.isdigit():
+                    layer = module[int(layer_name)]
+                else:
+                    layer = getattr(module, layer_name)
+            except (AttributeError, IndexError, KeyError) as e:
                 logger.warning(f"Could not find layer {layer_path}: {e}")
                 continue
 
@@ -250,7 +256,11 @@ class ModelManager:
                 if has_bias:
                     new_layer.bias = layer.bias
 
-            setattr(module, layer_name, new_layer)
+            # Set the new layer
+            if layer_name.isdigit():
+                module[int(layer_name)] = new_layer
+            else:
+                setattr(module, layer_name, new_layer)
             fused_count += 1
 
         # Validate fusion results

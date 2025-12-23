@@ -78,9 +78,16 @@ class SpeculativeDecodingSystem:
         self.rate_tracker = None
         self._initialized = False
         self._generation_count = 0  # Track generations for cache clearing
+        self._current_adapter_path: Optional[str] = None  # Track loaded adapter
+        self._current_adapter_info: Optional[Dict[str, Any]] = None  # Adapter metadata
 
-    def initialize(self) -> None:
-        """Initialize all components."""
+    def initialize(self, initial_adapter_path: Optional[str] = None) -> None:
+        """
+        Initialize all components.
+
+        Args:
+            initial_adapter_path: Optional LoRA adapter to load during initialization
+        """
         from .models import ModelManager
         from .speculative import SpeculativeDecoder
         from .data_collector import DataCollector, AcceptanceRateTracker
@@ -100,6 +107,26 @@ class SpeculativeDecodingSystem:
                 draft_model_name=self.config["models"]["draft"]["name"],
             )
             self.model_manager.load_models()
+
+            # Load initial adapter if specified
+            if initial_adapter_path:
+                try:
+                    adapter_path = self.resolve_adapter_path(initial_adapter_path)
+                    metadata = self.validate_adapter_structure(adapter_path)
+
+                    progress.update(
+                        task, description=f"Loading adapter: {adapter_path.name}..."
+                    )
+                    self.model_manager.load_lora_adapter(str(adapter_path), fuse=True)
+
+                    self._current_adapter_path = str(adapter_path)
+                    self._current_adapter_info = metadata
+
+                    progress.update(task, description="Adapter loaded!")
+                except Exception as e:
+                    logger.error(f"Failed to load initial adapter: {e}")
+                    console.print(f"[red]Warning: Could not load adapter: {e}[/red]")
+                    console.print("[yellow]Continuing with base model...[/yellow]")
 
             progress.update(task, description="Models loaded!")
 
@@ -150,6 +177,15 @@ class SpeculativeDecodingSystem:
                 title="Memory Usage",
             )
         )
+
+        # Display adapter status if loaded
+        if self._current_adapter_path:
+            console.print(
+                Panel(
+                    f"LoRA Adapter: [green]{Path(self._current_adapter_path).name}[/green]",
+                    title="Adapter Loaded",
+                )
+            )
 
     def generate(
         self,
@@ -663,6 +699,401 @@ class SpeculativeDecodingSystem:
             "tracker": tracker_stats,
         }
 
+    def resolve_adapter_path(self, path_or_alias: str) -> Path:
+        """
+        Resolve adapter path from user input (supports aliases and paths).
+
+        Supports:
+        - Aliases: 'best', 'final', 'latest'
+        - Relative paths: data/checkpoints/my_adapter
+        - Absolute paths: /full/path/to/adapter
+
+        Args:
+            path_or_alias: User input (path or alias)
+
+        Returns:
+            Resolved absolute Path object
+
+        Raises:
+            FileNotFoundError: If resolved path doesn't exist
+        """
+        checkpoint_dir = Path(self.config["training"]["checkpoint_dir"])
+
+        # Handle aliases
+        if path_or_alias.lower() in ["best", "final"]:
+            resolved = checkpoint_dir / path_or_alias.lower()
+        elif path_or_alias.lower() == "latest":
+            # Find most recently modified checkpoint directory
+            if not checkpoint_dir.exists():
+                raise FileNotFoundError(
+                    f"Checkpoint directory not found: {checkpoint_dir}"
+                )
+            checkpoints = [d for d in checkpoint_dir.iterdir() if d.is_dir()]
+            if not checkpoints:
+                raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
+            resolved = max(checkpoints, key=lambda p: p.stat().st_mtime)
+        else:
+            # Treat as path (relative or absolute)
+            resolved = Path(path_or_alias)
+            if not resolved.is_absolute():
+                resolved = Path.cwd() / resolved
+
+        if not resolved.exists():
+            raise FileNotFoundError(f"Adapter not found: {resolved}")
+
+        return resolved
+
+    def validate_adapter_structure(self, adapter_path: Path) -> Dict[str, Any]:
+        """
+        Validate adapter directory structure and return metadata.
+
+        Required files:
+        - adapters.safetensors (LoRA weights)
+        - adapter_config.json (rank, alpha, dropout)
+        - trainer_state.json (training metadata)
+
+        Args:
+            adapter_path: Path to adapter directory
+
+        Returns:
+            Merged metadata from config and trainer state
+
+        Raises:
+            ValueError: If structure is invalid or files are corrupted
+        """
+        import json
+
+        required_files = {
+            "adapters.safetensors": "LoRA weights file",
+            "adapter_config.json": "Adapter configuration",
+            "trainer_state.json": "Training state metadata",
+        }
+
+        # Check all required files exist
+        missing = []
+        for filename, description in required_files.items():
+            if not (adapter_path / filename).exists():
+                missing.append(f"{filename} ({description})")
+
+        if missing:
+            raise ValueError(
+                "Invalid adapter structure. Missing files:\n"
+                + "\n".join(f"  - {m}" for m in missing)
+            )
+
+        # Load and validate JSON files
+        try:
+            with open(adapter_path / "adapter_config.json") as f:
+                config = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid adapter_config.json: {e}")
+
+        try:
+            with open(adapter_path / "trainer_state.json") as f:
+                state = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid trainer_state.json: {e}")
+
+        # Extract metadata
+        lora_params = config.get("lora_parameters", {})
+        metadata = {
+            "rank": lora_params.get("rank"),
+            "alpha": lora_params.get("scale"),  # MLX-LM uses 'scale' not 'alpha'
+            "dropout": lora_params.get("dropout"),
+            "global_step": state.get("global_step"),
+            "best_loss": state.get("best_loss"),
+            "path": str(adapter_path),
+        }
+
+        # Validate required fields
+        if metadata["rank"] is None:
+            raise ValueError("adapter_config.json missing lora_parameters.rank")
+
+        return metadata
+
+    def _reinitialize_decoder(self) -> None:
+        """
+        Recreate the decoder with current models.
+
+        Called after adapter loading/unloading to ensure decoder uses
+        the updated draft model weights.
+
+        IMPORTANT: This preserves decoder settings (temperature, top_p, etc.)
+        but clears all internal state (KV caches).
+        """
+        from .speculative import SpeculativeDecoder
+
+        # Get current models from model manager
+        target_model, target_tokenizer = self.model_manager.get_target_model()
+        draft_model, draft_tokenizer = self.model_manager.get_draft_model()
+
+        # Create new decoder with same config
+        chat_config = self.config.get("chat", {})
+        self.decoder = SpeculativeDecoder(
+            target_model=target_model,
+            draft_model=draft_model,
+            tokenizer=target_tokenizer,  # Use target tokenizer (should be same)
+            num_draft_tokens=self.config["speculative"]["num_draft_tokens"],
+            temperature=self.config["speculative"]["temperature"],
+            top_p=self.config["speculative"]["top_p"],
+            acceptance_threshold=self.config["speculative"]["acceptance_threshold"],
+            system_message=chat_config.get("system_message"),
+        )
+
+        logger.info("Decoder reinitialized with updated draft model")
+
+    def load_lora_adapter(self, adapter_path: str) -> Dict[str, Any]:
+        """
+        Load a LoRA adapter and reinitialize the decoder.
+
+        This method:
+        1. Validates adapter path and structure
+        2. Loads adapter into draft model via ModelManager
+        3. Clears MLX memory cache
+        4. Reinitializes decoder with updated draft model
+        5. Returns adapter metadata for display
+
+        Args:
+            adapter_path: Path to adapter directory
+
+        Returns:
+            Dictionary with adapter info (rank, alpha, dropout, training_state)
+
+        Raises:
+            FileNotFoundError: If adapter path or required files don't exist
+            ValueError: If adapter structure is invalid
+            RuntimeError: If loading fails
+        """
+        # Validate first (fast fail)
+        try:
+            resolved_path = self.resolve_adapter_path(adapter_path)
+            metadata = self.validate_adapter_structure(resolved_path)
+        except (FileNotFoundError, ValueError) as e:
+            raise ValueError(f"Invalid adapter: {e}") from None
+
+        # Save current state for rollback
+        old_adapter_path = self._current_adapter_path
+
+        try:
+            # Load adapter (may fail with MLX errors)
+            self.model_manager.load_lora_adapter(str(resolved_path), fuse=True)
+
+            # Clear cache
+            self.model_manager.clear_cache()
+
+            # Reinitialize decoder
+            self._reinitialize_decoder()
+
+            # Update state
+            self._current_adapter_path = str(resolved_path)
+            self._current_adapter_info = metadata
+
+            logger.info(f"Loaded adapter: {resolved_path}")
+            return metadata
+
+        except Exception as e:
+            # System error - attempt rollback
+            logger.error(f"Failed to load adapter: {e}", exc_info=True)
+
+            # Try to restore previous state
+            if old_adapter_path:
+                try:
+                    self.model_manager.load_lora_adapter(old_adapter_path, fuse=True)
+                    self._reinitialize_decoder()
+                    console.print("[yellow]Rolled back to previous adapter[/yellow]")
+                except Exception:
+                    # Rollback failed - system in bad state
+                    console.print(
+                        "[red]Critical: Failed to rollback. "
+                        "Please restart interactive mode.[/red]"
+                    )
+
+            raise RuntimeError(f"Failed to load adapter: {e}") from e
+
+    def unload_lora_adapter(self) -> None:
+        """
+        Unload current adapter and revert to base model.
+
+        This requires reloading the draft model from scratch since
+        LoRA fusion is irreversible (weights are modified in-place).
+        """
+        if self._current_adapter_path is None:
+            logger.warning("Attempted to unload adapter, but none loaded")
+            return
+
+        console.print("[cyan]Reloading base model (this may take a moment)...[/cyan]")
+
+        try:
+            # Reload draft model without adapter
+            from mlx_lm import load
+            import mlx.core as mx
+
+            draft_model, draft_tokenizer = load(
+                self.config["models"]["draft"]["name"],
+                lazy=True,
+            )
+            mx.eval(draft_model.parameters())
+
+            # Update model manager
+            self.model_manager.draft_model = draft_model
+            self.model_manager.draft_tokenizer = draft_tokenizer
+
+            # Clear cache
+            self.model_manager.clear_cache()
+
+            # Reinitialize decoder
+            self._reinitialize_decoder()
+
+            # Update state
+            self._current_adapter_path = None
+            self._current_adapter_info = None
+
+            logger.info("Unloaded adapter, reverted to base model")
+
+        except Exception as e:
+            logger.error(f"Failed to unload adapter: {e}", exc_info=True)
+            raise RuntimeError(f"Failed to unload adapter: {e}") from e
+
+    def get_current_adapter_info(self) -> Optional[Dict[str, Any]]:
+        """
+        Get information about the currently loaded adapter.
+
+        Returns:
+            Adapter metadata dict if loaded, None otherwise
+        """
+        return self._current_adapter_info
+
+    def _format_adapter_status(self) -> str:
+        """Format current adapter status for display."""
+        if self._current_adapter_path is None:
+            return "Adapter: [yellow]None (base model)[/yellow]"
+        else:
+            adapter_name = Path(self._current_adapter_path).name
+            return f"Adapter: [green]{adapter_name}[/green]"
+
+    def _display_adapter_info(self, metadata: Dict[str, Any]) -> None:
+        """Display adapter metadata in a formatted table."""
+        from rich.table import Table
+
+        table = Table(title="LoRA Adapter", show_header=False, border_style="cyan")
+        table.add_column("Property", style="cyan", no_wrap=True)
+        table.add_column("Value", style="white")
+
+        # Path (show relative to CWD if possible)
+        path_str = metadata.get("path", "Unknown")
+        try:
+            path_rel = Path(path_str).relative_to(Path.cwd())
+            path_display = str(path_rel)
+        except ValueError:
+            path_display = path_str
+
+        table.add_row("Path", path_display)
+        table.add_row("Name", Path(path_str).name)
+
+        # LoRA hyperparameters
+        table.add_section()
+        table.add_row("Rank", str(metadata.get("rank", "Unknown")))
+        table.add_row("Alpha", str(metadata.get("alpha", "Unknown")))
+        table.add_row("Dropout", str(metadata.get("dropout", "Unknown")))
+
+        # Training metadata (if available)
+        if metadata.get("global_step") is not None:
+            table.add_section()
+            table.add_row("Training Steps", str(metadata["global_step"]))
+        if metadata.get("best_loss") is not None:
+            table.add_row("Best Loss", f"{metadata['best_loss']:.4f}")
+
+        console.print(table)
+        console.print(
+            "\n[yellow]Note: Decoder reinitialized with new adapter. "
+            "KV caches cleared.[/yellow]"
+        )
+
+    def _handle_command(self, cmd: str) -> bool:
+        """
+        Handle slash commands in interactive mode.
+
+        Args:
+            cmd: Command string (without the leading '/')
+
+        Returns:
+            True if should exit interactive mode, False otherwise
+        """
+        parts = cmd.strip().split(maxsplit=1)
+        command = parts[0].lower()
+        args = parts[1] if len(parts) > 1 else ""
+
+        if command in ("quit", "exit"):
+            return True
+
+        elif command == "stats":
+            stats = self.get_stats()
+            console.print(stats)
+
+        elif command == "train":
+            self.train()
+
+        elif command == "eval":
+            self.evaluate()
+
+        elif command == "clear":
+            console.clear()
+
+        elif command in ("load-adapter", "load"):
+            if not args:
+                console.print(
+                    "[red]Error: /load-adapter requires a path argument[/red]"
+                )
+                console.print("Usage: /load-adapter <path|best|final|latest>")
+                return False
+
+            try:
+                # Resolve and validate path
+                adapter_path = self.resolve_adapter_path(args)
+                metadata = self.validate_adapter_structure(adapter_path)
+
+                # Load adapter
+                console.print(f"[cyan]Loading LoRA adapter from: {adapter_path}[/cyan]")
+                self.load_lora_adapter(str(adapter_path))
+
+                # Display success + metadata
+                console.print("[green]✓ Adapter loaded successfully[/green]\n")
+                self._display_adapter_info(metadata)
+
+            except (FileNotFoundError, ValueError) as e:
+                console.print(f"[red]Error loading adapter: {e}[/red]")
+            except Exception as e:
+                console.print(f"[red]Unexpected error: {e}[/red]")
+                logger.exception("Error loading adapter")
+
+        elif command in ("unload-adapter", "unload"):
+            if self._current_adapter_path is None:
+                console.print("[yellow]No adapter currently loaded[/yellow]")
+                return False
+
+            try:
+                console.print(
+                    "[cyan]Unloading adapter and reverting to base model...[/cyan]"
+                )
+                self.unload_lora_adapter()
+                console.print("[green]✓ Adapter unloaded successfully[/green]")
+            except Exception as e:
+                console.print(f"[red]Error unloading adapter: {e}[/red]")
+                logger.exception("Error unloading adapter")
+
+        elif command in ("adapter-info", "adapter"):
+            info = self.get_current_adapter_info()
+            if info is None:
+                console.print("[yellow]No adapter currently loaded[/yellow]")
+            else:
+                self._display_adapter_info(info)
+
+        else:
+            console.print(f"[red]Unknown command: {command}[/red]")
+            console.print("Type a prompt to generate, or use /quit to exit")
+
+        return False
+
     def interactive_mode(self, implementation: str = "manual") -> None:
         """Run interactive generation mode.
 
@@ -675,15 +1106,21 @@ class SpeculativeDecodingSystem:
         impl_desc = (
             "Manual Spec-Dec" if implementation == "manual" else "MLX-LM Built-in"
         )
+        adapter_status = self._format_adapter_status()
+
         console.print(
             Panel(
-                f"Implementation: [cyan]{impl_desc}[/cyan]\n\n"
+                f"Implementation: [cyan]{impl_desc}[/cyan]\n"
+                f"{adapter_status}\n\n"
                 "Enter prompts to generate text. Commands:\n"
                 "  /quit - Exit interactive mode\n"
                 "  /stats - Show statistics\n"
                 "  /train - Train on collected data\n"
                 "  /eval - Run evaluation\n"
-                "  /clear - Clear screen",
+                "  /clear - Clear screen\n"
+                "  /load-adapter <path|best|final|latest> - Load LoRA adapter\n"
+                "  /unload-adapter - Unload adapter (revert to base model)\n"
+                "  /adapter-info - Show current adapter details",
                 title="Interactive Mode",
             )
         )
@@ -696,21 +1133,10 @@ class SpeculativeDecodingSystem:
                     continue
 
                 if prompt.startswith("/"):
-                    cmd = prompt[1:].lower().strip()
-
-                    if cmd == "quit" or cmd == "exit":
+                    # Handle command and check if should exit
+                    should_exit = self._handle_command(prompt[1:])
+                    if should_exit:
                         break
-                    elif cmd == "stats":
-                        stats = self.get_stats()
-                        console.print(stats)
-                    elif cmd == "train":
-                        self.train()
-                    elif cmd == "eval":
-                        self.evaluate()
-                    elif cmd == "clear":
-                        console.clear()
-                    else:
-                        console.print(f"[red]Unknown command: {cmd}[/red]")
                     continue
 
                 # Generate response
@@ -833,14 +1259,26 @@ def stats(ctx):
     default="manual",
     help="Speculative decoding implementation: 'manual' (default) or 'builtin'",
 )
+@click.option(
+    "--lora-adapter",
+    "-l",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+    default=None,
+    help="Path to LoRA adapter checkpoint directory (e.g., data/checkpoints/best)",
+)
 @click.pass_context
-def interactive(ctx, implementation):
+def interactive(ctx, implementation, lora_adapter):
     """Run interactive generation mode.
 
     Uses the manual speculative decoding implementation by default,
     which provides KV-cached target verification and token-level data collection.
     """
     system = SpeculativeDecodingSystem(ctx.obj["config"])
+
+    # Initialize with adapter if provided
+    if lora_adapter:
+        system.initialize(initial_adapter_path=lora_adapter)
+
     system.interactive_mode(implementation=implementation)
 
 
