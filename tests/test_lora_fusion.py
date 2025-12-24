@@ -208,20 +208,20 @@ class TestCheckpointFormat:
 
             # Should have lowercase lora_a and lora_b (MLX-LM format)
             weight_names = list(weights.keys())
-            assert any("lora_a" in name for name in weight_names), (
-                f"Expected lora_a in {weight_names}"
-            )
-            assert any("lora_b" in name for name in weight_names), (
-                f"Expected lora_b in {weight_names}"
-            )
+            assert any(
+                "lora_a" in name for name in weight_names
+            ), f"Expected lora_a in {weight_names}"
+            assert any(
+                "lora_b" in name for name in weight_names
+            ), f"Expected lora_b in {weight_names}"
 
             # Should NOT have uppercase lora_A or lora_B
-            assert not any("lora_A" in name for name in weight_names), (
-                f"Found lora_A in {weight_names}"
-            )
-            assert not any("lora_B" in name for name in weight_names), (
-                f"Found lora_B in {weight_names}"
-            )
+            assert not any(
+                "lora_A" in name for name in weight_names
+            ), f"Found lora_A in {weight_names}"
+            assert not any(
+                "lora_B" in name for name in weight_names
+            ), f"Found lora_B in {weight_names}"
 
 
 class TestTrainerFusion:
@@ -335,6 +335,281 @@ class TestTrainerFusion:
 
             # Outputs should be identical
             assert mx.allclose(lora_output, fused_output, atol=1e-5).item()
+
+
+class TestEnhancedLayerAccess:
+    """Tests for enhanced layer access in ModelManager (indexed vs named layers)."""
+
+    def test_load_adapter_with_indexed_layers(self):
+        """Test loading adapter on model with indexed layers (e.g., model.layers[0])."""
+        from src.models import ModelManager
+        from unittest.mock import Mock
+
+        # Create a model with indexed layers structure
+        class IndexedLayerModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Use a list of layers that can be accessed by index
+                self.layers = [nn.Linear(16, 16) for _ in range(3)]
+
+            def __call__(self, x):
+                for layer in self.layers:
+                    x = layer(x)
+                return x
+
+        model = IndexedLayerModel()
+        mx.eval(model.parameters())
+
+        # Create mock tokenizer
+        mock_tokenizer = Mock()
+
+        # Create ModelManager and set draft model
+        manager = ModelManager(
+            target_model_name="test/target",
+            draft_model_name="test/draft",
+        )
+        manager.draft_model = model
+        manager.draft_tokenizer = mock_tokenizer
+
+        # Create adapter directory with weights for indexed layer
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir) / "adapter"
+            adapter_dir.mkdir()
+
+            # Create adapter config
+            adapter_config = {
+                "fine_tune_type": "lora",
+                "lora_parameters": {
+                    "rank": 4,
+                    "scale": 8.0,
+                    "dropout": 0.0,
+                },
+                "lora_layers": ["layers.0", "layers.2"],  # Index-based paths
+            }
+            with open(adapter_dir / "adapter_config.json", "w") as f:
+                json.dump(adapter_config, f)
+
+            # Create adapter weights
+            weights = {
+                "layers.0.lora_a": mx.random.normal((4, 16)),
+                "layers.0.lora_b": mx.random.normal((16, 4)),
+                "layers.2.lora_a": mx.random.normal((4, 16)),
+                "layers.2.lora_b": mx.random.normal((16, 4)),
+            }
+            mx.save_safetensors(str(adapter_dir / "adapters.safetensors"), weights)
+
+            # Load adapter - should handle indexed access correctly
+            manager.load_lora_adapter(str(adapter_dir), fuse=True)
+
+            # Verify layers are still nn.Linear (not LoRALinear since fuse=True)
+            assert isinstance(manager.draft_model.layers[0], nn.Linear)
+            assert isinstance(manager.draft_model.layers[2], nn.Linear)
+
+            # Verify weights were modified (fused)
+            # Original weights shape should be preserved
+            assert manager.draft_model.layers[0].weight.shape == (16, 16)
+
+    def test_load_adapter_with_named_layers(self):
+        """Test loading adapter on model with named attribute layers."""
+        from src.models import ModelManager
+        from unittest.mock import Mock
+
+        # Create a model with named attributes
+        class NamedLayerModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q_proj = nn.Linear(16, 16)
+                self.k_proj = nn.Linear(16, 16)
+                self.v_proj = nn.Linear(16, 16)
+
+            def __call__(self, x):
+                return self.q_proj(x) + self.k_proj(x) + self.v_proj(x)
+
+        model = NamedLayerModel()
+        mx.eval(model.parameters())
+
+        mock_tokenizer = Mock()
+
+        manager = ModelManager(
+            target_model_name="test/target",
+            draft_model_name="test/draft",
+        )
+        manager.draft_model = model
+        manager.draft_tokenizer = mock_tokenizer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir) / "adapter"
+            adapter_dir.mkdir()
+
+            # Create adapter config
+            adapter_config = {
+                "fine_tune_type": "lora",
+                "lora_parameters": {
+                    "rank": 4,
+                    "scale": 8.0,
+                    "dropout": 0.0,
+                },
+                "lora_layers": ["q_proj", "v_proj"],  # Named attribute paths
+            }
+            with open(adapter_dir / "adapter_config.json", "w") as f:
+                json.dump(adapter_config, f)
+
+            # Create adapter weights
+            weights = {
+                "q_proj.lora_a": mx.random.normal((4, 16)),
+                "q_proj.lora_b": mx.random.normal((16, 4)),
+                "v_proj.lora_a": mx.random.normal((4, 16)),
+                "v_proj.lora_b": mx.random.normal((16, 4)),
+            }
+            mx.save_safetensors(str(adapter_dir / "adapters.safetensors"), weights)
+
+            # Load adapter
+            manager.load_lora_adapter(str(adapter_dir), fuse=True)
+
+            # Verify layers are still nn.Linear
+            assert isinstance(manager.draft_model.q_proj, nn.Linear)
+            assert isinstance(manager.draft_model.v_proj, nn.Linear)
+            assert isinstance(manager.draft_model.k_proj, nn.Linear)
+
+    def test_load_adapter_with_nested_indexed_layers(self):
+        """Test loading adapter on model with nested indexed structure (e.g., model.layers[0].attention)."""
+        from src.models import ModelManager
+        from unittest.mock import Mock
+
+        # Create a model with nested structure
+        class AttentionBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q_proj = nn.Linear(16, 16)
+                self.v_proj = nn.Linear(16, 16)
+
+            def __call__(self, x):
+                return self.q_proj(x) + self.v_proj(x)
+
+        class NestedIndexedModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Create indexed list of attention blocks
+                self.layers = [AttentionBlock() for _ in range(2)]
+
+            def __call__(self, x):
+                for layer in self.layers:
+                    x = layer(x)
+                return x
+
+        model = NestedIndexedModel()
+        mx.eval(model.parameters())
+
+        mock_tokenizer = Mock()
+
+        manager = ModelManager(
+            target_model_name="test/target",
+            draft_model_name="test/draft",
+        )
+        manager.draft_model = model
+        manager.draft_tokenizer = mock_tokenizer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir) / "adapter"
+            adapter_dir.mkdir()
+
+            # Create adapter config with nested indexed paths
+            adapter_config = {
+                "fine_tune_type": "lora",
+                "lora_parameters": {
+                    "rank": 4,
+                    "scale": 8.0,
+                    "dropout": 0.0,
+                },
+                "lora_layers": [
+                    "layers.0.q_proj",  # Indexed layer, named attribute
+                    "layers.1.v_proj",  # Different indexed layer
+                ],
+            }
+            with open(adapter_dir / "adapter_config.json", "w") as f:
+                json.dump(adapter_config, f)
+
+            # Create adapter weights
+            weights = {
+                "layers.0.q_proj.lora_a": mx.random.normal((4, 16)),
+                "layers.0.q_proj.lora_b": mx.random.normal((16, 4)),
+                "layers.1.v_proj.lora_a": mx.random.normal((4, 16)),
+                "layers.1.v_proj.lora_b": mx.random.normal((16, 4)),
+            }
+            mx.save_safetensors(str(adapter_dir / "adapters.safetensors"), weights)
+
+            # Load adapter - should handle mixed indexed/named access
+            manager.load_lora_adapter(str(adapter_dir), fuse=True)
+
+            # Verify correct layers were modified
+            assert isinstance(manager.draft_model.layers[0].q_proj, nn.Linear)
+            assert isinstance(manager.draft_model.layers[1].v_proj, nn.Linear)
+
+    def test_load_adapter_handles_missing_layer_gracefully(self):
+        """Test that loading adapter with invalid layer path logs warning but continues with valid layers."""
+        from src.models import ModelManager
+        from unittest.mock import Mock
+
+        class SimpleModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q_proj = nn.Linear(16, 16)
+                self.v_proj = nn.Linear(16, 16)
+
+            def __call__(self, x):
+                return self.q_proj(x) + self.v_proj(x)
+
+        model = SimpleModel()
+        mx.eval(model.parameters())
+
+        mock_tokenizer = Mock()
+
+        manager = ModelManager(
+            target_model_name="test/target",
+            draft_model_name="test/draft",
+        )
+        manager.draft_model = model
+        manager.draft_tokenizer = mock_tokenizer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir) / "adapter"
+            adapter_dir.mkdir()
+
+            # Create adapter config with one invalid and two valid layers
+            adapter_config = {
+                "fine_tune_type": "lora",
+                "lora_parameters": {
+                    "rank": 4,
+                    "scale": 8.0,
+                    "dropout": 0.0,
+                },
+                "lora_layers": [
+                    "nonexistent_layer",
+                    "q_proj",
+                    "v_proj",
+                ],  # One invalid, two valid
+            }
+            with open(adapter_dir / "adapter_config.json", "w") as f:
+                json.dump(adapter_config, f)
+
+            # Create adapter weights (include weights for nonexistent layer)
+            weights = {
+                "nonexistent_layer.lora_a": mx.random.normal((4, 16)),
+                "nonexistent_layer.lora_b": mx.random.normal((16, 4)),
+                "q_proj.lora_a": mx.random.normal((4, 16)),
+                "q_proj.lora_b": mx.random.normal((16, 4)),
+                "v_proj.lora_a": mx.random.normal((4, 16)),
+                "v_proj.lora_b": mx.random.normal((16, 4)),
+            }
+            mx.save_safetensors(str(adapter_dir / "adapters.safetensors"), weights)
+
+            # Load adapter - should log warning about missing layer but continue with valid layers
+            # Should NOT raise exception since 2 out of 3 layers are valid (>50%)
+            manager.load_lora_adapter(str(adapter_dir), fuse=True)
+
+            # Verify the valid layers were successfully loaded
+            assert isinstance(manager.draft_model.q_proj, nn.Linear)
+            assert isinstance(manager.draft_model.v_proj, nn.Linear)
 
 
 if __name__ == "__main__":
