@@ -901,12 +901,19 @@ class SpeculativeDecodingSystem:
                     self.model_manager.load_lora_adapter(old_adapter_path, fuse=True)
                     self._reinitialize_decoder()
                     console.print("[yellow]Rolled back to previous adapter[/yellow]")
-                except Exception:
+                except Exception as rollback_error:
                     # Rollback failed - system in bad state
-                    console.print(
-                        "[red]Critical: Failed to rollback. "
-                        "Please restart interactive mode.[/red]"
+                    logger.critical(
+                        f"Rollback failed after load error: {rollback_error}",
+                        exc_info=True,
                     )
+                    console.print(
+                        "[red]Critical: System in inconsistent state. "
+                        "Interactive mode may be unstable. "
+                        "Please restart if you encounter issues.[/red]"
+                    )
+                    # Mark system as potentially unstable
+                    self._initialized = False
 
             raise RuntimeError(f"Failed to load adapter: {e}") from e
 
