@@ -1,324 +1,123 @@
-# Speculative Decoding with Adaptive LoRA Training
+# SpecLoRA
 
-A high-performance inference system for Apple Silicon that uses speculative decoding with an adaptive LoRA training loop. The system improves draft model performance over time by learning from cases where it disagrees with the target model.
+**Make your language models faster by teaching them from their mistakes.**
 
-## Overview
+SpecLoRA combines speculative decoding with adaptive LoRA training to speed up inference on Apple Silicon. Instead of just using a small draft model to guess what a larger model would say, the system learns from disagreements and improves over time.
 
-### What is Speculative Decoding?
+## The Idea
 
-Speculative decoding is an inference optimization technique that uses two models:
-- **Target Model**: Large, accurate model (Qwen2.5-3B-Instruct, 4-bit quantized)
-- **Draft Model**: Small, fast model (Qwen2.5-0.5B-Instruct, 4-bit quantized)
+Large language models are slow because they generate one token at a time. Speculative decoding speeds this up by having a small "draft" model quickly guess the next few tokens, then checking them all at once with the large "target" model. When the draft guesses correctly, you get multiple tokens for the price of one verification.
 
-The algorithm:
-1. Draft model generates K candidate tokens quickly
-2. Target model verifies all K tokens in a single forward pass (parallel)
-3. Accepted tokens are kept; rejected tokens are resampled from target
-4. Speedup when draft agrees with target (high acceptance rate)
+The problem? Draft models often disagree with target models, killing the speedup.
 
-### What is Adaptive LoRA Training?
-
-When the draft model frequently disagrees with the target model (low acceptance rate), we collect these "failure cases" and fine-tune the draft model using LoRA (Low-Rank Adaptation) to better match the target's behavior.
-
-This creates a feedback loop:
-1. **Inference** → Track acceptance rates
-2. **Collect** → Store failure cases
-3. **Train** → LoRA fine-tune draft model
-4. **Improve** → Higher acceptance rate → Faster inference
-
-## Features
-
-- 🚀 **Speculative Decoding**: 1.5-2x speedup over standard generation
-- 🎯 **Adaptive Training**: Draft model improves over time
-- 💾 **Memory Efficient**: Works on 16GB RAM MacBooks
-- 📊 **Metrics Tracking**: Acceptance rates, tokens/second, training progress
-- 🔧 **Configurable**: All hyperparameters in `config.yaml`
-- 🖥️ **CLI Interface**: Easy-to-use commands
-
-## Requirements
-
-- macOS with Apple Silicon (M1/M2/M3)
-- Python 3.10+
-- 16GB+ RAM (32GB recommended)
-- ~15GB disk space for models
-
-## Installation
-
-### 1. Clone the Repository
-
-```bash
-git clone <repository-url>
-cd speculative-decoding-lora
-```
-
-### 2. Create Virtual Environment
-
-```bash
-python -m venv venv
-source venv/bin/activate
-```
-
-### 3. Install Dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 4. Verify MLX Installation
-
-```bash
-python -c "import mlx.core as mx; print(mx.default_device())"
-# Should output: Device(gpu, 0)
-```
+The solution: **Learn from disagreements.** When the draft model gets it wrong, we collect those cases and fine-tune it using LoRA (Low-Rank Adaptation). Over time, the draft model gets better at predicting what the target would say, acceptance rates go up, and everything gets faster.
 
 ## Quick Start
 
-### Run Demo
-
 ```bash
+# Setup
+git clone <repository-url>
+cd SpecLoRA
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Run demo
 python -m src.main demo
 ```
 
-This will:
-1. Download and load the models (first run only)
-2. Run sample generations
-3. Show acceptance rate metrics
-
-### Interactive Mode
+The first run downloads models (~15GB). After that, you can:
 
 ```bash
+# Generate text
+python -m src.main generate "Explain quantum computing simply."
+
+# Interactive mode
 python -m src.main interactive
-```
 
-Commands in interactive mode:
-- `/stats` - Show current statistics
-- `/train` - Train on collected failure cases
-- `/eval` - Run evaluation benchmark
-- `/quit` - Exit
-
-### Generate Text
-
-```bash
-python -m src.main generate "Explain quantum computing in simple terms."
-```
-
-### Train the Draft Model
-
-```bash
+# Train on collected failures
 python -m src.main train
 ```
 
-### Benchmark Performance
+## Requirements
 
-```bash
-python -m src.main benchmark --prompt "What is machine learning?" --iterations 10
-```
+- **macOS with Apple Silicon** (M1/M2/M3/M4)
+- **Python 3.10+**
+- **16GB+ RAM** (32GB better for larger models)
 
-## Configuration
-
-All settings are in `configs/config.yaml`:
-
-```yaml
-# Model Configuration
-models:
-  target:
-    name: "mlx-community/Qwen2.5-3B-Instruct-4bit"
-  draft:
-    name: "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
-
-# Speculative Decoding
-speculative:
-  num_draft_tokens: 4          # K tokens to draft
-  temperature: 0.7             # Sampling temperature
-  acceptance_threshold: 0.5    # Below = failure case
-
-# Chat formatting (tokenizer template only)
-chat:
-  system_message: "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
-
-# LoRA Training
-training:
-  lora:
-    rank: 8                    # LoRA rank (small for 16GB RAM)
-    alpha: 16                  # LoRA alpha
-  learning_rate: 1.0e-4
-  min_failure_cases: 50        # When to trigger training
-```
-
-> **Note:** The system now always formats prompts using the tokenizer's native `apply_chat_template()` implementation. Ensure the target/draft tokenizer pair provides this method; only the `system_message` above is configurable.
-
-## Architecture
-
-```
-project/
-├── src/
-│   ├── models.py          # Model loading and management
-│   ├── speculative.py     # Speculative decoding algorithm
-│   ├── training.py        # LoRA training pipeline
-│   ├── data_collector.py  # Failure case collection
-│   └── main.py            # CLI and orchestration
-├── data/
-│   ├── failures/          # Collected failure cases (JSONL)
-│   └── checkpoints/       # LoRA checkpoints
-├── configs/
-│   └── config.yaml        # All hyperparameters
-└── requirements.txt
-```
+This uses [MLX](https://github.com/ml-explore/mlx), Apple's ML framework optimized for unified memory.
 
 ## How It Works
 
-### 1. Speculative Decoding Flow
+1. **Draft model** (Qwen2.5-0.5B) quickly generates 4 candidate tokens
+2. **Target model** (Qwen2.5-3B) verifies all 4 in parallel
+3. Accepted tokens are kept, rejected ones are resampled
+4. When acceptance rate is low, the case gets saved
+5. After collecting enough failures, train the draft model with LoRA
+6. Improved draft → higher acceptance → faster inference
+
+The feedback loop means the system gets faster the more you use it.
+
+## Key Features
+
+**Speculative Decoding**: 1.5-2x speedup out of the box
+**Adaptive Training**: Draft model improves from failures
+**Memory Efficient**: Runs on 16GB MacBooks with 4-bit quantization
+**Two Modes**: Fast mode for production, detailed mode for data collection
+
+## Configuration
+
+Edit `configs/config.yaml` to change models, adjust how many tokens to draft (K), set the acceptance threshold for failures, or tune LoRA training parameters.
+
+The defaults work well for 16GB machines. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for details.
+
+## Project Structure
 
 ```
-Draft Model        Target Model
-    |                   |
-    v                   |
-Generate K tokens       |
-    |                   |
-    +-------> Verify all K tokens (parallel)
-                        |
-                        v
-              Accept/Reject each token
-                        |
-                        v
-              Return accepted tokens + resample if needed
+src/
+  models.py            # Model loading, LoRA fusion, KV cache
+  speculative.py       # Fast mode (wraps MLX-LM)
+  speculative_manual.py  # Detailed mode (token-level tracking)
+  data_collector.py    # Failure case collection
+  training.py          # LoRA training pipeline
+  main.py             # CLI commands
+
+data/
+  failures/           # Collected failure cases (JSONL)
+  checkpoints/        # Trained LoRA adapters
+
+configs/
+  config.yaml         # All settings
 ```
 
-### 2. Adaptive Training Loop
+## Documentation
 
-```
-┌─────────────────────────────────────────────────┐
-│                                                 │
-│   Generate with Speculative Decoding            │
-│              ↓                                  │
-│   Track Acceptance Rate                         │
-│              ↓                                  │
-│   If acceptance < threshold:                    │
-│       Store as failure case                     │
-│              ↓                                  │
-│   When N failures collected:                    │
-│       Trigger LoRA Training                     │
-│              ↓                                  │
-│   Draft model improves → Higher acceptance      │
-│              ↓                                  │
-│   Loop back to generation                       │
-│                                                 │
-└─────────────────────────────────────────────────┘
-```
+- **[Architecture](docs/ARCHITECTURE.md)** - How the system works internally
+- **[Configuration](docs/CONFIGURATION.md)** - Settings and tuning guide
+- **[Troubleshooting](docs/TROUBLESHOOTING.md)** - Common issues and solutions
+- **[API Reference](docs/API.md)** - Using SpecLoRA programmatically
 
-### 3. LoRA Fine-Tuning
-
-We use Low-Rank Adaptation to efficiently fine-tune the draft model:
-- Only ~0.5% of parameters are trainable
-- Fits in 16GB RAM
-- Fast training (minutes, not hours)
-- Preserves original model capabilities via replay buffer
-
-## API Usage
-
-```python
-from src.main import SpeculativeDecodingSystem
-import yaml
-
-# Load config
-with open("configs/config.yaml") as f:
-    config = yaml.safe_load(f)
-
-# Initialize system
-system = SpeculativeDecodingSystem(config)
-system.initialize()
-
-# Generate text
-response = system.generate("What is the meaning of life?")
-print(response)
-
-# Get statistics
-stats = system.get_stats()
-print(f"Acceptance rate: {stats['tracker']['recent_average']:.1%}")
-
-# Train when ready
-system.train()
-```
-
-## Performance Tips
-
-### Memory Optimization
-
-1. **Use 4-bit quantized target model** (default)
-2. **Keep batch size at 1** for 16GB RAM
-3. **Clear cache periodically**: Happens automatically
-4. **Reduce max_tokens** if running out of memory
-
-### Speed Optimization
-
-1. **Increase num_draft_tokens** (K=4-8) for higher throughput
-2. **Use temperature=0** (greedy) for more consistent acceptance
-3. **Train frequently** to improve acceptance rate
-
-### Acceptance Rate Tips
-
-- Higher acceptance = faster generation
-- Target 60-80% acceptance rate
-- Train more frequently if acceptance drops
-- Different prompt types may have different rates
-
-## Troubleshooting
-
-### Out of Memory
+## Development
 
 ```bash
-# Reduce model sizes in config.yaml
-models:
-  target:
-    name: "mlx-community/Qwen2.5-3B-Instruct-4bit"  # Smaller target
-  draft:
-    name: "mlx-community/Qwen2.5-0.5B-Instruct-4bit"  # Quantized draft (smaller)
+# Run tests
+python -m pytest tests/
+
+# Linting and formatting
+ruff check . --fix
+ruff format .
+
+# Install pre-commit hooks
+pre-commit install
 ```
-
-### Slow Model Loading
-
-First run downloads models from Hugging Face. Subsequent runs use cache:
-```bash
-# Models cached at: ~/.cache/huggingface/hub/
-```
-
-### Low Acceptance Rate
-
-1. Check if prompts match training data distribution
-2. Increase temperature for more diverse sampling
-3. Collect more failure cases and train
-4. Consider using a larger draft model
-
-## Metrics Explained
-
-| Metric | Description | Good Value |
-|--------|-------------|------------|
-| Acceptance Rate | % of draft tokens accepted | >50% |
-| Tokens/Second | Generation speed | Higher = better |
-| Failure Cases | Prompts with low acceptance | Use for training |
-| Training Loss | LoRA training loss | Lower = better |
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run tests: `python -m pytest tests/`
-5. Submit a pull request
-
-## License
-
-MIT License - see LICENSE file for details.
 
 ## References
 
-- [Speculative Decoding Paper](https://arxiv.org/abs/2211.17192)
-- [LoRA: Low-Rank Adaptation](https://arxiv.org/abs/2106.09685)
-- [MLX Framework](https://github.com/ml-explore/mlx)
-- [Qwen2.5 Models](https://huggingface.co/Qwen)
+- [Speculative Decoding](https://arxiv.org/abs/2211.17192) - Original paper
+- [LoRA](https://arxiv.org/abs/2106.09685) - Low-Rank Adaptation
+- [MLX](https://github.com/ml-explore/mlx) - Apple's ML framework
+- [Qwen2.5](https://huggingface.co/Qwen) - Models used in this project
 
-## Acknowledgments
+## License
 
-- Apple MLX team for the framework
-- Qwen team for the models
-- HuggingFace for model hosting
+MIT
