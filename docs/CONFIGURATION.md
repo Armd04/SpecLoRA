@@ -2,6 +2,15 @@
 
 All settings live in `configs/config.yaml`. This guide explains what each option does and how to tune them.
 
+## Quick Tuning Guide
+
+**Maximize speed:** Increase `num_draft_tokens` to 6-8
+**Maximize quality:** Lower `temperature` to 0.5 or use greedy (0.0)
+**Reduce memory:** Use 3B target instead of 7B, set `rank: 4`
+**Collect more data:** Lower `acceptance_threshold` to 0.4
+
+---
+
 ## Model Configuration
 
 ```yaml
@@ -33,7 +42,7 @@ models:
 ```yaml
 speculative:
   num_draft_tokens: 4
-  temperature: 0.7
+  temperature: 0.6
   top_p: 0.9
   acceptance_threshold: 0.5
 ```
@@ -46,7 +55,7 @@ speculative:
 
 **temperature**: Sampling randomness
 - **0.0**: Greedy (deterministic), highest acceptance rates
-- **0.7**: Balanced (default)
+- **0.6**: Balanced (default)
 - **1.0+**: Creative but lower acceptance rates
 
 **top_p**: Nucleus sampling cutoff
@@ -79,13 +88,13 @@ training:
     rank: 8
     alpha: 16
     target_modules: ["q_proj", "v_proj"]
-  learning_rate: 1.0e-4
+  learning_rate: 1.0e-5
   batch_size: 1
-  gradient_accumulation_steps: 4
-  num_epochs: 3
-  warmup_steps: 10
-  min_failure_cases: 50
-  replay_ratio: 0.2
+  gradient_accumulation_steps: 2
+  num_epochs: 2
+  warmup_steps: 5
+  min_failure_cases: 30
+  replay_ratio: 0.3
   max_sequence_length: 2048
 ```
 
@@ -140,12 +149,12 @@ training:
 ### Data Collection
 
 **min_failure_cases**: Minimum failures before training triggers
-- **Default: 50** - enough for meaningful training
+- **Default: 30** - enough for meaningful training
 - Lower (20): Train sooner, but noisier
 - Higher (100+): More data, slower feedback loop
 
 **replay_ratio**: Fraction of each batch from replay buffer
-- **Default: 0.2** (20%) - prevents catastrophic forgetting
+- **Default: 0.3** (30%) - prevents catastrophic forgetting
 - 0.0: Only train on failures (risky, may forget good behavior)
 - 0.5: Equal mix of failures and successes
 - Higher: More conservative, slower improvement
@@ -221,7 +230,8 @@ training:
   lora:
     rank: 8
   batch_size: 1
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 2
+  min_failure_cases: 30
 memory:
   gradient_checkpointing: true
 ```
@@ -251,7 +261,7 @@ speculative:
   temperature: 0.0  # Greedy = higher acceptance
   acceptance_threshold: 0.3  # Only collect terrible cases
 training:
-  min_failure_cases: 100  # Train less frequently
+  min_failure_cases: 100  # Train less frequently (collect more data first)
 ```
 
 ### Prioritizing Quality

@@ -53,6 +53,8 @@ pip install -r requirements.txt
 
 ### Out of Memory During Training
 
+**Platform:** macOS with Apple Silicon (M1/M2/M3/M4)
+
 **Symptom:**
 ```
 RuntimeError: Failed to allocate memory
@@ -94,6 +96,8 @@ RuntimeError: Failed to allocate memory
    ```
 
 ### Out of Memory During Generation
+
+**Platform:** macOS with Apple Silicon (M1/M2/M3/M4)
 
 **Symptom:**
 ```
@@ -268,8 +272,8 @@ Trained model, acceptance rate unchanged or worse.
 5. **Train longer**:
    ```yaml
    training:
-     num_epochs: 5  # Increase from 3
-     min_failure_cases: 100  # Collect more data
+     num_epochs: 5  # Increase from 2
+     min_failure_cases: 100  # Collect more data (default is 30)
    ```
 
 ## Data Collection Issues
@@ -358,8 +362,10 @@ WARNING: NaN or Inf detected in loss
 
 ### Training Crashes
 
+**Platform:** macOS with Apple Silicon
+
 **Symptom:**
-Process killed during training.
+Process killed during training (no error message, just exits).
 
 **Fix:**
 Out of memory. See "Out of Memory During Training" section above.

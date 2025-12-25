@@ -118,7 +118,7 @@ The `SpeculativeDecodingSystem` class coordinates everything:
 4. If acceptance_rate < threshold:
    → DataCollector.add_failure()
    ↓
-5. When failures >= min_failure_cases:
+5. When failures >= min_failure_cases (default: 30):
    → LoRATrainer.train()
    ↓
 6. Save checkpoint → ModelManager.load_lora_adapter(fuse=True)

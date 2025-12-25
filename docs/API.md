@@ -13,12 +13,22 @@ with open("configs/config.yaml") as f:
     config = yaml.safe_load(f)
 
 # Initialize system
-system = SpeculativeDecodingSystem(config)
-system.initialize()
+try:
+    system = SpeculativeDecodingSystem(config)
+    system.initialize()
+except ValueError as e:
+    print(f"Invalid config: {e}")
+    exit(1)
+except RuntimeError as e:
+    print(f"Initialization failed: {e}")
+    exit(1)
 
 # Generate text
-response = system.generate("What is machine learning?")
-print(response)
+try:
+    response = system.generate("What is machine learning?")
+    print(response)
+except RuntimeError as e:
+    print(f"Generation failed: {e}")
 ```
 
 ## SpeculativeDecodingSystem
@@ -64,11 +74,14 @@ response = system.generate(
 answer = system.generate("Explain Python in one sentence.", mode="fast")
 
 # Detailed mode (collect training data)
-answer = system.generate(
-    "Explain Python in detail.",
-    mode="detailed",
-    max_tokens=1024
-)
+try:
+    answer = system.generate(
+        "Explain Python in detail.",
+        mode="detailed",
+        max_tokens=1024
+    )
+except RuntimeError as e:
+    print(f"Generation failed: {e}")
 ```
 
 ### Training

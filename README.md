@@ -8,7 +8,7 @@ SpecLoRA combines speculative decoding with adaptive LoRA training to speed up i
 
 Large language models are slow because they generate one token at a time. Speculative decoding speeds this up by having a small "draft" model quickly guess the next few tokens, then checking them all at once with the large "target" model. When the draft guesses correctly, you get multiple tokens for the price of one verification.
 
-The problem? Draft models often disagree with target models, killing the speedup.
+The problem? Draft models often disagree with target models, requiring rejection and resampling, which kills the speedup.
 
 The solution: **Learn from disagreements.** When the draft model gets it wrong, we collect those cases and fine-tune it using LoRA (Low-Rank Adaptation). Over time, the draft model gets better at predicting what the target would say, acceptance rates go up, and everything gets faster.
 
@@ -53,17 +53,17 @@ This uses [MLX](https://github.com/ml-explore/mlx), Apple's ML framework optimiz
 2. **Target model** (Qwen2.5-3B) verifies all 4 in parallel
 3. Accepted tokens are kept, rejected ones are resampled
 4. When acceptance rate is low, the case gets saved
-5. After collecting enough failures, train the draft model with LoRA
+5. After collecting min_failure_cases (default: 30), train the draft model with LoRA
 6. Improved draft → higher acceptance → faster inference
 
 The feedback loop means the system gets faster the more you use it.
 
 ## Key Features
 
-**Speculative Decoding**: 1.5-2x speedup out of the box
-**Adaptive Training**: Draft model improves from failures
-**Memory Efficient**: Runs on 16GB MacBooks with 4-bit quantization
-**Two Modes**: Fast mode for production, detailed mode for data collection
+- **Speculative Decoding**: 1.5-2x speedup out of the box
+- **Adaptive Training**: Draft model improves from failures
+- **Memory Efficient**: Runs on 16GB MacBooks with 4-bit quantization
+- **Two Modes**: Fast mode for production, detailed mode for data collection
 
 ## Configuration
 
