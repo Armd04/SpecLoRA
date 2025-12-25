@@ -88,6 +88,18 @@ evaluation:
     - "Write a haiku about programming."
     - "Solve this math problem: If x + 5 = 12, what is x?"
 
+# Benchmark Suite
+benchmark:
+  # Default benchmark settings
+  max_tokens: 256  # Tokens to generate per prompt
+  iterations: 1    # Iterations per prompt (for averaging)
+  
+  # Default adapter to use (best/final/latest or path)
+  default_adapter: "best"
+  
+  # Output directory for benchmark results
+  results_dir: "data/benchmarks"
+
 # Logging
 logging:
   level: "INFO"

@@ -94,6 +94,7 @@ configs/
 
 - **[Architecture](docs/ARCHITECTURE.md)** - How the system works internally
 - **[Configuration](docs/CONFIGURATION.md)** - Settings and tuning guide
+- **[Benchmark Suite](docs/BENCHMARK.md)** - Performance benchmarking guide
 - **[Troubleshooting](docs/TROUBLESHOOTING.md)** - Common issues and solutions
 - **[API Reference](docs/API.md)** - Using SpecLoRA programmatically
 

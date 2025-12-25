@@ -1500,6 +1500,160 @@ def collect_data(ctx, prompts_file, prompts, max_tokens, limit, output):
     console.print("\n[green]Data collection complete![/green]")
 
 
+@cli.command("benchmark-suite")
+@click.option(
+    "--prompts-file",
+    "-f",
+    type=click.Path(exists=True),
+    default=None,
+    help="File with prompts (one per line). If not provided, uses evaluation.test_prompts from config.",
+)
+@click.option(
+    "--limit",
+    "-l",
+    type=int,
+    default=None,
+    help="Limit number of prompts to benchmark (randomly samples if limiting)",
+)
+@click.option(
+    "--max-tokens",
+    "-m",
+    type=int,
+    default=256,
+    help="Maximum tokens per generation",
+)
+@click.option(
+    "--iterations",
+    "-n",
+    type=int,
+    default=1,
+    help="Number of iterations per prompt for averaging",
+)
+@click.option(
+    "--lora-adapter",
+    "-a",
+    type=str,
+    default="best",
+    help="LoRA adapter path or alias (best/final/latest). Default: best",
+)
+@click.option(
+    "--skip-lora",
+    is_flag=True,
+    help="Skip LoRA benchmarks (only run target-only and base spec dec)",
+)
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(),
+    default=None,
+    help="Output JSON file path for results",
+)
+@click.pass_context
+def benchmark_suite(
+    ctx, prompts_file, limit, max_tokens, iterations, lora_adapter, skip_lora, output
+):
+    """
+    Run comprehensive benchmark suite comparing decoding modes.
+
+    Compares three modes:
+    1. Target-only: Standard autoregressive decoding (baseline)
+    2. Spec Dec (Base): Speculative decoding with base draft model
+    3. Spec Dec (LoRA): Speculative decoding with LoRA-adapted draft model
+
+    Examples:
+        # Use config test prompts (default)
+        python -m src.main benchmark-suite
+
+        # Use prompts from file, limit to 15
+        python -m src.main benchmark-suite -f prompts.txt --limit 15
+
+        # Run 3 iterations per prompt for averaging, export results
+        python -m src.main benchmark-suite -f prompts.txt -n 3 -o results.json
+
+        # Skip LoRA benchmarks
+        python -m src.main benchmark-suite --skip-lora
+
+        # Use specific adapter
+        python -m src.main benchmark-suite -a data/checkpoints/final
+    """
+    from .benchmark import run_benchmark_suite
+
+    # Load prompts
+    if prompts_file:
+        # Load from file
+        prompts = []
+        with open(prompts_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    prompts.append(line)
+    else:
+        # Use config evaluation prompts
+        prompts = ctx.obj["config"].get("evaluation", {}).get("test_prompts", [])
+        if not prompts:
+            console.print(
+                "[red]Error: No prompts found in config.evaluation.test_prompts[/red]"
+            )
+            console.print(
+                "Either provide --prompts-file or add test_prompts to config.yaml"
+            )
+            return
+
+    if not prompts:
+        console.print("[red]Error: No prompts to benchmark[/red]")
+        return
+
+    # Apply limit (randomly sample)
+    original_count = len(prompts)
+    if limit is not None and limit > 0 and limit < len(prompts):
+        prompts = random.sample(prompts, limit)
+        console.print(
+            f"[yellow]Randomly sampled {limit} prompts (from {original_count} total)[/yellow]"
+        )
+
+    # Initialize system
+    system = SpeculativeDecodingSystem(ctx.obj["config"])
+
+    # Resolve adapter path (only needs config, not full initialization)
+    adapter_path = None
+    if not skip_lora:
+        try:
+            # resolve_adapter_path() and validate_adapter_structure() only need self.config
+            # Don't initialize yet to avoid loading models twice
+            adapter_path = str(system.resolve_adapter_path(lora_adapter))
+
+            # Validate adapter structure
+            _ = system.validate_adapter_structure(Path(adapter_path))
+
+            console.print(
+                f"[cyan]LoRA adapter validated: {Path(adapter_path).name}[/cyan]"
+            )
+        except FileNotFoundError as e:
+            console.print(f"[red]LoRA adapter not found: {e}[/red]")
+            console.print("[yellow]Continuing without LoRA benchmarks[/yellow]")
+            skip_lora = True
+        except Exception as e:
+            console.print(f"[red]Error validating adapter: {e}[/red]")
+            console.print("[yellow]Continuing without LoRA benchmarks[/yellow]")
+            skip_lora = True
+
+    # Now initialize system (load models once)
+    system.initialize()
+
+    # Run benchmark suite
+    run_benchmark_suite(
+        system=system,
+        prompts=prompts,
+        max_tokens=max_tokens,
+        iterations=iterations,
+        lora_adapter_path=adapter_path,
+        skip_lora=skip_lora,
+        output_path=output,
+    )
+
+    console.print("\n[green]✓ Benchmark suite complete![/green]")
+
+
 @cli.command()
 @click.pass_context
 def demo(ctx):

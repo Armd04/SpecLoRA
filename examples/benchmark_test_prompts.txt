@@ -1,0 +1,9 @@
+# Test prompts for benchmark suite verification
+# These are short prompts to verify the benchmark works correctly
+
+What is Python?
+
+Explain machine learning in one sentence.
+
+Write a simple "Hello World" program.
+
