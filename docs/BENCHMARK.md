@@ -286,8 +286,7 @@ For 16GB MacBooks:
 ### Created Files
 
 - `src/benchmark.py` - Benchmark module
-- `data/benchmark_test_prompts.txt` - Test prompts
-- `verify_benchmark.py` - Verification script
+- `examples/benchmark_test_prompts.txt` - Test prompts
 
 ### Modified Files
 
