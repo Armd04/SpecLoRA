@@ -150,6 +150,7 @@ class BenchmarkRunner:
         formatted_prompt = self.system.decoder.format_prompt(prompt)
         prompt_tokens = self.system.decoder.tokenizer.encode(formatted_prompt)
         total_tokens = len(self.system.decoder.tokenizer.encode(text))
+        # The `generate_standard` method includes the prompt tokens in the total tokens, so we need to subtract them.
         generated_tokens = max(0, total_tokens - len(prompt_tokens))
 
         tokens_per_second = generated_tokens / max(elapsed, 0.001)
