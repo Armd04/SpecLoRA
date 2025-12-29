@@ -146,8 +146,8 @@ When using `--output`, results are exported in JSON format:
         "acceptance_rate": 0.71,
         "total_tokens": 152
       }
-    }
-    // ... more prompts
+    },
+    ...
   ]
 }
 ```
