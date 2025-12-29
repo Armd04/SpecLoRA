@@ -587,31 +587,40 @@ def run_benchmark_suite(
             _ = runner.run_spec_lora(warmup_prompt, max_tokens=32)
             mx.clear_cache()
             console.print("[green]✓ LoRA warmup complete[/green]")
-
-            console.print(
-                "\n[bold cyan]Phase 3: Speculative Decoding (LoRA Draft)[/bold cyan]"
-            )
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                console=console,
-            ) as progress:
-                task = progress.add_task(
-                    "Running spec dec (LoRA) benchmarks...",
-                    total=len(prompts) * iterations,
-                )
-
-                for prompt in prompts:
-                    for iteration in range(iterations):
-                        result = runner.run_spec_lora(prompt, max_tokens)
-                        result.iteration = iteration
-                        all_results.append(result)
-                        progress.advance(task)
         except Exception as e:
             console.print(f"[red]✗ Failed to load LoRA adapter: {e}[/red]")
             console.print("[yellow]Skipping LoRA benchmarks[/yellow]")
+        else:
+            # Adapter loaded successfully, now run benchmarks
+            console.print(
+                "\n[bold cyan]Phase 3: Speculative Decoding (LoRA Draft)[/bold cyan]"
+            )
+            try:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    console=console,
+                ) as progress:
+                    task = progress.add_task(
+                        "Running spec dec (LoRA) benchmarks...",
+                        total=len(prompts) * iterations,
+                    )
+
+                    for prompt in prompts:
+                        for iteration in range(iterations):
+                            result = runner.run_spec_lora(prompt, max_tokens)
+                            result.iteration = iteration
+                            all_results.append(result)
+                            progress.advance(task)
+            except Exception as e:
+                console.print(f"[red]✗ Error during LoRA benchmarking: {e}[/red]")
+                console.print(
+                    "[yellow]Removing partial LoRA results from this run[/yellow]"
+                )
+                # Remove partial LoRA results to avoid misleading aggregation
+                all_results = [r for r in all_results if r.mode != "spec_lora"]
 
     # Aggregate results
     console.print("\n[bold cyan]Computing aggregate statistics...[/bold cyan]")
