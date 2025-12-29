@@ -426,12 +426,12 @@ def display_results(summary: BenchmarkSummary) -> None:
             ) * 100
             console.print(
                 f"[bold green]LoRA improvement over Base:[/bold green] "
-                f"+{tps_improvement:.1f}% tok/s, +{acc_improvement:.1f}% acceptance"
+                f"{tps_improvement:+.1f}% tok/s, {acc_improvement:+.1f}% acceptance"
             )
         else:
             console.print(
                 f"[bold green]LoRA improvement over Base:[/bold green] "
-                f"+{tps_improvement:.1f}% tok/s"
+                f"{tps_improvement:+.1f}% tok/s"
             )
 
     # Per-prompt details (abbreviated)
