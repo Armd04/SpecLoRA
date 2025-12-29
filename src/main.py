@@ -1315,10 +1315,6 @@ def benchmark(ctx, prompt, iterations, max_tokens, implementation):
     # Create manual decoder if needed
     manual_decoder = system.decoder.create_manual_decoder()
 
-    # Get the formatted prompt length for token counting
-    formatted_prompt = system.decoder._format_prompt(prompt)
-    prompt_token_count = len(system.decoder.tokenizer.encode(formatted_prompt))
-
     # Warm up
     console.print("[cyan]Warming up...[/cyan]")
     if implementation == "manual":
@@ -1355,14 +1351,11 @@ def benchmark(ctx, prompt, iterations, max_tokens, implementation):
     std_tokens = []
 
     for _ in range(iterations):
-        start = time.time()
-        text, elapsed = system.decoder.generate_standard(
+        # generate_standard now returns (text, elapsed, num_generated_tokens)
+        text, elapsed, generated_tokens = system.decoder.generate_standard(
             prompt, max_tokens=max_tokens, use_target=True
         )
         std_times.append(elapsed)
-        # Count only generated tokens (total - prompt)
-        total_tokens = len(system.decoder.tokenizer.encode(text))
-        generated_tokens = max(0, total_tokens - prompt_token_count)
         std_tokens.append(generated_tokens)
 
     # Results

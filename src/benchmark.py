@@ -140,18 +140,12 @@ class BenchmarkRunner:
             BenchmarkResult with timing metrics
         """
         # Use the decoder's generate_standard method
-        text, elapsed = self.system.decoder.generate_standard(
+        # Returns (text, elapsed_time, num_generated_tokens)
+        text, elapsed, generated_tokens = self.system.decoder.generate_standard(
             prompt=prompt,
             max_tokens=max_tokens,
             use_target=True,
         )
-
-        # Count generated tokens (exclude prompt)
-        formatted_prompt = self.system.decoder.format_prompt(prompt)
-        prompt_tokens = self.system.decoder.tokenizer.encode(formatted_prompt)
-        total_tokens = len(self.system.decoder.tokenizer.encode(text))
-        # The `generate_standard` method includes the prompt tokens in the total tokens, so we need to subtract them.
-        generated_tokens = max(0, total_tokens - len(prompt_tokens))
 
         tokens_per_second = generated_tokens / max(elapsed, 0.001)
 
@@ -311,6 +305,18 @@ def group_results_by_prompt(results: List[BenchmarkResult]) -> List[Dict[str, An
             mode_results = [r for r in prompt_results if r.mode == mode]
             if mode_results:
                 # Average across iterations
+                # For acceptance rate, only average non-None values
+                acceptance_rates = [
+                    r.acceptance_rate
+                    for r in mode_results
+                    if r.acceptance_rate is not None
+                ]
+                avg_acceptance = (
+                    sum(acceptance_rates) / len(acceptance_rates)
+                    if acceptance_rates
+                    else None
+                )
+
                 entry[mode] = {
                     "tokens_per_second": sum(r.tokens_per_second for r in mode_results)
                     / len(mode_results),
@@ -318,17 +324,9 @@ def group_results_by_prompt(results: List[BenchmarkResult]) -> List[Dict[str, An
                         r.time_to_last_token for r in mode_results
                     )
                     / len(mode_results),
-                    "acceptance_rate": sum(
-                        r.acceptance_rate
-                        for r in mode_results
-                        if r.acceptance_rate is not None
-                    )
-                    / len(mode_results)
-                    if any(r.acceptance_rate for r in mode_results)
-                    else None,
-                    "total_tokens": mode_results[
-                        0
-                    ].total_tokens,  # Should be same for all iterations
+                    "acceptance_rate": avg_acceptance,
+                    "total_tokens": sum(r.total_tokens for r in mode_results)
+                    / len(mode_results),
                 }
 
         grouped.append(entry)
@@ -545,6 +543,9 @@ def run_benchmark_suite(
                 all_results.append(result)
                 progress.advance(task)
 
+    # Clear cache between phases for fair comparison
+    mx.clear_cache()
+
     # Phase 2: Spec Dec (Base)
     console.print("\n[bold cyan]Phase 2: Speculative Decoding (Base Draft)[/bold cyan]")
     with Progress(
@@ -565,6 +566,9 @@ def run_benchmark_suite(
                 all_results.append(result)
                 progress.advance(task)
 
+    # Clear cache between phases for fair comparison
+    mx.clear_cache()
+
     # Phase 3: Spec Dec (LoRA) - if not skipped
     if not skip_lora and lora_adapter_path:
         console.print("\n[bold cyan]Phase 3: Loading LoRA Adapter[/bold cyan]")
@@ -577,6 +581,12 @@ def run_benchmark_suite(
             console.print(
                 f"  Rank: {metadata.get('rank', 'unknown')}, Alpha: {metadata.get('alpha', 'unknown')}"
             )
+
+            # Warmup LoRA-adapted model
+            console.print("[cyan]Warming up LoRA-adapted model...[/cyan]")
+            _ = runner.run_spec_lora(warmup_prompt, max_tokens=32)
+            mx.clear_cache()
+            console.print("[green]✓ LoRA warmup complete[/green]")
 
             console.print(
                 "\n[bold cyan]Phase 3: Speculative Decoding (LoRA Draft)[/bold cyan]"

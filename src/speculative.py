@@ -18,7 +18,7 @@ from typing import List, Optional, Tuple, Dict, Any, Callable, TYPE_CHECKING
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm import stream_generate, generate as mlx_generate
+from mlx_lm import stream_generate
 from mlx_lm.sample_utils import make_sampler
 
 if TYPE_CHECKING:
@@ -303,7 +303,7 @@ class SpeculativeDecoder:
         prompt: str,
         max_tokens: int = 256,
         use_target: bool = True,
-    ) -> Tuple[str, float]:
+    ) -> Tuple[str, float, int]:
         """
         Generate text using standard (non-speculative) decoding with MLX-LM.
 
@@ -315,28 +315,40 @@ class SpeculativeDecoder:
             use_target: Use target model (True) or draft model (False)
 
         Returns:
-            Tuple of (generated_text, time_seconds)
+            Tuple of (generated_text, time_seconds, num_generated_tokens)
         """
         model = self.target_model if use_target else self.draft_model
 
         # Format prompt using the appropriate chat template
         formatted_prompt = self._format_prompt(prompt)
 
+        # Create sampler with temperature and top_p
+        sampler = self._create_sampler()
+
         start_time = time.time()
 
-        text = mlx_generate(
+        # Use stream_generate to get actual tokens (no re-encoding!)
+        generated_tokens = []
+        generated_text = ""
+
+        for response in stream_generate(
             model=model,
             tokenizer=self.tokenizer,
             prompt=formatted_prompt,
             max_tokens=max_tokens,
-            verbose=False,
-        )
+            sampler=sampler,
+        ):
+            generated_tokens.append(response.token)
+            generated_text += response.text
 
         elapsed = time.time() - start_time
 
+        # Actual token count from generation (no re-encoding)
+        num_generated = len(generated_tokens)
+
         mx.clear_cache()
 
-        return text, elapsed
+        return generated_text, elapsed, num_generated
 
     def create_manual_decoder(self) -> "ManualSpeculativeDecoder":
         """
