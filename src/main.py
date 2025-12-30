@@ -643,8 +643,12 @@ class SpeculativeDecodingSystem:
             else:
                 comparison += " [red](worse)[/red]"
             console.print(Panel(comparison, title="Comparison with Existing Best"))
+            default_choice = metrics.avg_loss < existing_best_loss
+        else:
+            console.print("[yellow]No existing best checkpoint found.[/yellow]")
+            default_choice = True
 
-        if click.confirm("\nSave this adapter to 'best'?", default=True):
+        if click.confirm("\nSave this adapter to 'best'?", default=default_choice):
             best_path = trainer.save_to_best()
             console.print(f"[green]✓ Saved to: {best_path}[/green]")
 
