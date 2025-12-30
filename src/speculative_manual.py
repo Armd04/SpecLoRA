@@ -226,17 +226,16 @@ class ManualSpeculativeDecoder:
         if logits.ndim > 1:
             logits = logits.reshape(-1)
 
-        probs = mx.softmax(logits, axis=-1)
-
         if self.temperature == 0:
-            # Greedy
+            # Greedy: probability is 1 for the chosen token
             token = mx.argmax(logits).item()
-        else:
-            # Temperature sampling
-            scaled_logits = logits / self.temperature
-            token = mx.random.categorical(scaled_logits).item()
+            return token, 1.0
 
-        prob = probs[token].item()
+        # Temperature-scaled sampling and probability from the same distribution
+        scaled_logits = logits / self.temperature
+        scaled_probs = mx.softmax(scaled_logits, axis=-1)
+        token = mx.random.categorical(scaled_logits).item()
+        prob = scaled_probs[token].item()
         return token, prob
 
     def _verify_and_accept(
@@ -244,6 +243,7 @@ class ManualSpeculativeDecoder:
         draft_token: int,
         draft_prob: float,
         target_logits: mx.array,
+        draft_logits: mx.array,
         debug: bool = False,
     ) -> Tuple[bool, int, float]:
         """
@@ -256,6 +256,7 @@ class ManualSpeculativeDecoder:
             draft_token: Token proposed by draft model
             draft_prob: Probability draft assigned to this token
             target_logits: Target model's logits for this position
+            draft_logits: Draft model's logits for this position (used for residual sampling)
             debug: If True, print debug information
 
         Returns:
@@ -266,8 +267,14 @@ class ManualSpeculativeDecoder:
 
         if target_logits.ndim > 1:
             target_logits = target_logits.reshape(-1)
+        if draft_logits.ndim > 1:
+            draft_logits = draft_logits.reshape(-1)
 
-        target_probs = mx.softmax(target_logits, axis=-1)
+        if self.temperature == 0:
+            target_probs = mx.softmax(target_logits, axis=-1)
+        else:
+            scaled_target_logits = target_logits / self.temperature
+            target_probs = mx.softmax(scaled_target_logits, axis=-1)
         mx.eval(target_probs)
 
         if self.temperature == 0:
@@ -286,8 +293,22 @@ class ManualSpeculativeDecoder:
                 return False, target_choice, target_probs[target_choice].item()
         else:
             # Probabilistic acceptance: accept with prob min(1, p_target/p_draft)
-            target_prob_for_draft = target_probs[draft_token].item()
-            acceptance_ratio = min(1.0, target_prob_for_draft / max(draft_prob, 1e-10))
+            scaled_draft_logits = draft_logits / self.temperature
+            draft_probs_full = mx.softmax(scaled_draft_logits, axis=-1)
+            mx.eval(draft_probs_full)
+
+            target_vocab = target_probs.shape[-1]
+            draft_vocab = draft_probs_full.shape[-1]
+
+            if draft_token >= target_vocab:
+                # Draft proposed a token outside target vocab; force reject
+                target_prob_for_draft = 0.0
+                acceptance_ratio = 0.0
+            else:
+                target_prob_for_draft = target_probs[draft_token].item()
+                acceptance_ratio = min(
+                    1.0, target_prob_for_draft / max(draft_prob, 1e-10)
+                )
 
             r = mx.random.uniform().item()
             accepted = r < acceptance_ratio
@@ -303,9 +324,33 @@ class ManualSpeculativeDecoder:
             if accepted:
                 return True, draft_token, target_prob_for_draft
             else:
-                # Sample from target distribution
-                scaled_logits = target_logits / self.temperature
-                target_choice = mx.random.categorical(scaled_logits).item()
+                # Sample from residual distribution to preserve target law
+                if draft_vocab < target_vocab:
+                    pad = mx.zeros(
+                        (target_vocab - draft_vocab,), dtype=target_probs.dtype
+                    )
+                    draft_probs_aligned = mx.concatenate(
+                        [draft_probs_full, pad], axis=0
+                    )
+                elif draft_vocab > target_vocab:
+                    draft_probs_aligned = draft_probs_full[:target_vocab]
+                else:
+                    draft_probs_aligned = draft_probs_full
+
+                residual = mx.maximum(target_probs - draft_probs_aligned, 0.0)
+
+                mx.eval(residual)
+                residual_mass = mx.sum(residual).item()
+
+                if residual_mass <= 0:
+                    # Fallback: sample from target distribution
+                    scaled_target_logits = target_logits / self.temperature
+                    target_choice = mx.random.categorical(scaled_target_logits).item()
+                    return False, target_choice, target_probs[target_choice].item()
+
+                residual_probs = residual / residual_mass
+                residual_logits = mx.log(residual_probs + 1e-12)
+                target_choice = mx.random.categorical(residual_logits).item()
                 return False, target_choice, target_probs[target_choice].item()
 
     def generate_with_data_collection(
@@ -394,6 +439,7 @@ class ManualSpeculativeDecoder:
             # ============================================================
             draft_tokens: List[int] = []
             draft_probs: List[float] = []
+            draft_logits_list: List[mx.array] = []
 
             # Save current cache position - we'll rewind after draft generation
             # since draft tokens are speculative
@@ -417,6 +463,7 @@ class ManualSpeculativeDecoder:
                 token, prob = self._sample_token(current_logits)
                 draft_tokens.append(token)
                 draft_probs.append(prob)
+                draft_logits_list.append(current_logits)
 
                 if token == self.eos_token_id:
                     break
@@ -541,6 +588,7 @@ class ManualSpeculativeDecoder:
                     draft_token,
                     draft_prob,
                     target_logits_for_verify,
+                    draft_logits_list[k],
                     debug=should_debug,
                 )
 
