@@ -330,6 +330,7 @@ class TrainingMetrics:
     avg_loss: float = 0.0
     learning_rate: float = 0.0
     training_time_seconds: float = 0.0
+    adapter_path: Optional[str] = None  # Path to saved adapter
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -337,6 +338,7 @@ class TrainingMetrics:
             "avg_loss": self.avg_loss,
             "learning_rate": self.learning_rate,
             "training_time": self.training_time_seconds,
+            "adapter_path": self.adapter_path,
         }
 
 
@@ -384,6 +386,10 @@ class LoRATrainer:
         self.max_grad_norm = max_grad_norm
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # Unique run ID for this training session (Unix timestamp)
+        self._run_id = int(time.time())
+        self._adapter_path: Optional[str] = None  # Path to saved adapter
 
         # Apply LoRA to model
         self.model = apply_lora_to_model(model, lora_config)
@@ -1033,27 +1039,28 @@ class LoRATrainer:
             if eval_callback:
                 eval_callback(epoch, avg_epoch_loss)
 
-            # Save best model
+            # Track best loss (but don't auto-save to "best" folder)
             if avg_epoch_loss < self.best_loss:
                 self.best_loss = avg_epoch_loss
-                self.save_checkpoint("best")
 
         # Final metrics
         metrics.training_time_seconds = time.time() - start_time
         metrics.avg_loss = metrics.total_loss / max(1, metrics.total_steps)
         metrics.learning_rate = self.learning_rate
 
-        # Save final checkpoint
-        self.save_checkpoint("final")
+        # Save adapter to timestamped folder (adapter-{run_id})
+        adapter_path = self.save_checkpoint()
+        metrics.adapter_path = adapter_path
 
         logger.info(
             f"Training complete. Total time: {metrics.training_time_seconds:.1f}s, "
-            f"Average loss: {metrics.avg_loss:.4f}"
+            f"Average loss: {metrics.avg_loss:.4f}, "
+            f"Adapter saved to: {adapter_path}"
         )
 
         return metrics
 
-    def save_checkpoint(self, name: str) -> str:
+    def save_checkpoint(self, name: Optional[str] = None) -> str:
         """
         Save a training checkpoint in MLX-LM compatible format.
 
@@ -1061,12 +1068,15 @@ class LoRATrainer:
         and adapter_config.json for native MLX-LM loading.
 
         Args:
-            name: Checkpoint name
+            name: Checkpoint name. If None, uses adapter-{run_id} format.
 
         Returns:
             Path to saved checkpoint
         """
         import json
+
+        if name is None:
+            name = f"adapter-{self._run_id}"
 
         checkpoint_path = self.checkpoint_dir / name
         checkpoint_path.mkdir(parents=True, exist_ok=True)
@@ -1116,8 +1126,64 @@ class LoRATrainer:
         with open(checkpoint_path / "trainer_state.json", "w") as f:
             json.dump(state, f, indent=2)
 
+        # Track the latest saved adapter path
+        self._adapter_path = str(checkpoint_path)
+
         logger.info(f"Saved checkpoint: {checkpoint_path}")
         return str(checkpoint_path)
+
+    def save_to_best(self) -> str:
+        """
+        Save the current adapter to the 'best' folder.
+
+        This copies the adapter files from the last saved checkpoint to the 'best'
+        folder. This method works even after fuse_and_get_model() has been called
+        (which removes LoRA layers from the model).
+
+        Returns:
+            Path to the best checkpoint
+
+        Raises:
+            RuntimeError: If no adapter has been saved yet
+        """
+        import shutil
+
+        if self._adapter_path is None:
+            raise RuntimeError(
+                "No adapter has been saved yet. Call save_checkpoint() first."
+            )
+
+        source_path = Path(self._adapter_path)
+        best_path = self.checkpoint_dir / "best"
+
+        # Remove existing best if it exists
+        if best_path.exists():
+            shutil.rmtree(best_path)
+
+        # Copy the saved adapter to 'best'
+        shutil.copytree(source_path, best_path)
+
+        logger.info(f"Copied adapter from {source_path} to {best_path}")
+        return str(best_path)
+
+    def get_existing_best_loss(self) -> Optional[float]:
+        """
+        Get the loss from the existing 'best' checkpoint if available.
+
+        Returns:
+            Best loss value or None if no best checkpoint exists
+        """
+        import json
+
+        best_path = self.checkpoint_dir / "best" / "trainer_state.json"
+        if best_path.exists():
+            try:
+                with open(best_path, "r") as f:
+                    state = json.load(f)
+                return state.get("best_loss")
+            except (json.JSONDecodeError, IOError):
+                return None
+        return None
 
     def load_checkpoint(self, checkpoint_path: str) -> None:
         """

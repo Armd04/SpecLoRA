@@ -2,7 +2,7 @@
 Tests for LoRA adapter loading and management functionality.
 
 Tests the adapter loading system added in the addLoadAdapter branch:
-- Path resolution (aliases: best, final, latest)
+- Path resolution (aliases: best, latest)
 - Adapter structure validation
 - Adapter loading and unloading
 - Decoder reinitialization
@@ -33,7 +33,6 @@ class TestAdapterPathResolution:
 
             # Create some checkpoint directories
             (checkpoint_dir / "best").mkdir()
-            (checkpoint_dir / "final").mkdir()
             (checkpoint_dir / "checkpoint_001").mkdir()
             (checkpoint_dir / "checkpoint_002").mkdir()
 
@@ -61,13 +60,6 @@ class TestAdapterPathResolution:
         assert resolved == checkpoint_dir / "best"
         assert resolved.exists()
 
-    def test_resolve_alias_final(self, system_with_temp_config):
-        """Test resolving 'final' alias."""
-        system, checkpoint_dir = system_with_temp_config
-        resolved = system.resolve_adapter_path("final")
-        assert resolved == checkpoint_dir / "final"
-        assert resolved.exists()
-
     def test_resolve_alias_latest(self, system_with_temp_config):
         """Test resolving 'latest' alias (most recent checkpoint)."""
         system, checkpoint_dir = system_with_temp_config
@@ -80,7 +72,9 @@ class TestAdapterPathResolution:
         system, checkpoint_dir = system_with_temp_config
         assert system.resolve_adapter_path("BEST") == checkpoint_dir / "best"
         assert system.resolve_adapter_path("Best") == checkpoint_dir / "best"
-        assert system.resolve_adapter_path("FiNaL") == checkpoint_dir / "final"
+        assert (
+            system.resolve_adapter_path("LATEST") == checkpoint_dir / "checkpoint_002"
+        )
 
     def test_resolve_relative_path(self, system_with_temp_config):
         """Test resolving relative path."""
@@ -98,9 +92,9 @@ class TestAdapterPathResolution:
     def test_resolve_absolute_path(self, system_with_temp_config):
         """Test resolving absolute path."""
         system, checkpoint_dir = system_with_temp_config
-        abs_path = str(checkpoint_dir / "final")
+        abs_path = str(checkpoint_dir / "best")
         resolved = system.resolve_adapter_path(abs_path)
-        assert resolved == checkpoint_dir / "final"
+        assert resolved == checkpoint_dir / "best"
 
     def test_resolve_nonexistent_raises_error(self, system_with_temp_config):
         """Test that resolving nonexistent path raises FileNotFoundError."""

@@ -26,7 +26,7 @@ python -m src.main benchmark-suite -f prompts.txt -n 3
 python -m src.main benchmark-suite -f prompts.txt -o results/benchmark.json
 
 # Use specific LoRA adapter
-python -m src.main benchmark-suite -a data/checkpoints/final
+python -m src.main benchmark-suite -a data/checkpoints/best
 ```
 
 ### Command Options
@@ -37,7 +37,7 @@ python -m src.main benchmark-suite -a data/checkpoints/final
 | `--limit` | `-l` | None | Limit number of prompts (randomly samples) |
 | `--max-tokens` | `-m` | 256 | Maximum tokens per generation |
 | `--iterations` | `-n` | 1 | Iterations per prompt for averaging |
-| `--lora-adapter` | `-a` | best | Adapter path or alias (best/final/latest) |
+| `--lora-adapter` | `-a` | best | Adapter path or alias (best/latest) |
 | `--skip-lora` | - | False | Skip LoRA benchmarks |
 | `--output` | `-o` | None | JSON output file path |
 
@@ -188,11 +188,14 @@ To compare different training checkpoints:
 # Benchmark with 'best' checkpoint
 python -m src.main benchmark-suite -f test_prompts.txt -a best -o best_results.json
 
-# Benchmark with 'final' checkpoint
-python -m src.main benchmark-suite -f test_prompts.txt -a final -o final_results.json
+# Benchmark with 'latest' checkpoint (most recent training run)
+python -m src.main benchmark-suite -f test_prompts.txt -a latest -o latest_results.json
+
+# Benchmark with a specific timestamped adapter
+python -m src.main benchmark-suite -f test_prompts.txt -a data/checkpoints/adapter-1735500000 -o specific_results.json
 
 # Compare results
-diff best_results.json final_results.json
+diff best_results.json latest_results.json
 ```
 
 ### Averaging Multiple Runs

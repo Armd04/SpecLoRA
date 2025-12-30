@@ -166,6 +166,148 @@ class TestCheckpointFormat:
             assert adapter_config["lora_parameters"]["rank"] == 4
             assert adapter_config["lora_parameters"]["scale"] == 8.0
 
+    def test_checkpoint_default_timestamped_naming(self):
+        """Test that save_checkpoint() uses adapter-{timestamp} naming by default."""
+
+        # Create a simple model
+        class SimpleModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q_proj = nn.Linear(16, 16)
+
+            def __call__(self, x):
+                return self.q_proj(x)
+
+        model = SimpleModel()
+        mx.eval(model.parameters())
+
+        # Mock tokenizer
+        class MockTokenizer:
+            pad_token_id = 0
+
+            def encode(self, text):
+                return [1, 2, 3]
+
+        tokenizer = MockTokenizer()
+
+        config = LoRAConfig(rank=4, alpha=8, dropout=0.0, target_modules=["q_proj"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trainer = LoRATrainer(
+                model=model,
+                tokenizer=tokenizer,
+                lora_config=config,
+                checkpoint_dir=tmpdir,
+            )
+
+            # Save checkpoint without explicit name
+            checkpoint_path = trainer.save_checkpoint()
+
+            # Verify path follows adapter-{timestamp} format
+            checkpoint_dir = Path(checkpoint_path)
+            assert checkpoint_dir.name.startswith("adapter-")
+            # Extract timestamp part and verify it's a valid integer
+            timestamp_str = checkpoint_dir.name.replace("adapter-", "")
+            timestamp = int(timestamp_str)  # Should not raise
+            assert timestamp > 0
+
+            # Verify files exist
+            assert (checkpoint_dir / "adapters.safetensors").exists()
+            assert (checkpoint_dir / "adapter_config.json").exists()
+            assert (checkpoint_dir / "trainer_state.json").exists()
+
+    def test_save_to_best(self):
+        """Test that save_to_best() copies adapter to 'best' folder."""
+
+        # Create a simple model
+        class SimpleModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q_proj = nn.Linear(16, 16)
+
+            def __call__(self, x):
+                return self.q_proj(x)
+
+        model = SimpleModel()
+        mx.eval(model.parameters())
+
+        # Mock tokenizer
+        class MockTokenizer:
+            pad_token_id = 0
+
+            def encode(self, text):
+                return [1, 2, 3]
+
+        tokenizer = MockTokenizer()
+
+        config = LoRAConfig(rank=4, alpha=8, dropout=0.0, target_modules=["q_proj"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trainer = LoRATrainer(
+                model=model,
+                tokenizer=tokenizer,
+                lora_config=config,
+                checkpoint_dir=tmpdir,
+            )
+
+            # First save a checkpoint (required before save_to_best)
+            original_path = trainer.save_checkpoint()
+            assert Path(original_path).name.startswith("adapter-")
+
+            # Now save to best (copies from saved checkpoint)
+            best_path = trainer.save_to_best()
+
+            # Verify path is the 'best' folder
+            assert Path(best_path).name == "best"
+            assert (Path(best_path) / "adapters.safetensors").exists()
+            assert (Path(best_path) / "adapter_config.json").exists()
+            assert (Path(best_path) / "trainer_state.json").exists()
+
+    def test_save_to_best_after_fusion(self):
+        """Test that save_to_best() works even after fuse_and_get_model()."""
+
+        # Create a simple model
+        class SimpleModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q_proj = nn.Linear(16, 16)
+
+            def __call__(self, x):
+                return self.q_proj(x)
+
+        model = SimpleModel()
+        mx.eval(model.parameters())
+
+        # Mock tokenizer
+        class MockTokenizer:
+            pad_token_id = 0
+
+            def encode(self, text):
+                return [1, 2, 3]
+
+        tokenizer = MockTokenizer()
+
+        config = LoRAConfig(rank=4, alpha=8, dropout=0.0, target_modules=["q_proj"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trainer = LoRATrainer(
+                model=model,
+                tokenizer=tokenizer,
+                lora_config=config,
+                checkpoint_dir=tmpdir,
+            )
+
+            # Fuse LoRA weights (removes LoRA layers from model)
+            trainer.fuse_and_get_model()
+
+            # save_to_best() should still work by copying files
+            best_path = trainer.save_to_best()
+
+            # Verify the best folder has correct files
+            assert Path(best_path).name == "best"
+            assert (Path(best_path) / "adapters.safetensors").exists()
+            assert (Path(best_path) / "adapter_config.json").exists()
+
     def test_checkpoint_uses_mlx_lm_naming(self):
         """Test that saved weights use MLX-LM naming convention (lora_a, lora_b)."""
 

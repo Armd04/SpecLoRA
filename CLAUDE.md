@@ -129,7 +129,8 @@ The system is organized into distinct modules with clear responsibilities:
   - `LoRATrainer`: Fine-tunes draft model on collected failure cases
   - Mixed training: combines failure cases (80%) with replay buffer (20%)
   - Gradient checkpointing for memory efficiency
-  - Saves checkpoints to `data/checkpoints/`
+  - Saves checkpoints to `data/checkpoints/adapter-{timestamp}` folders
+  - After training, prompts user to save to `best` folder
   - **Important**: Handles quantized layers by dequantizing during training, then re-quantizing during fusion
 
 - **`src/main.py`**: CLI orchestration and main entry point
@@ -162,7 +163,8 @@ Understanding the LoRA lifecycle is critical:
    - Draft model loads in FP16 or quantized format
    - If quantized, weights are dequantized before wrapping with `LoRALinear`
    - Only LoRA parameters (A, B matrices) are trainable (~0.5% of params)
-   - Checkpoints save both LoRA weights and adapter config
+   - Checkpoints save to `adapter-{unix_timestamp}` folders (e.g., `adapter-1735500000`)
+   - After training, user is prompted to optionally save to `best` folder
 
 2. **Inference Phase**:
    - Load LoRA adapter with `fuse=True` (default in `load_lora_adapter()`)

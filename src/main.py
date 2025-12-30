@@ -626,9 +626,27 @@ class SpeculativeDecodingSystem:
         results_table.add_row("Total Steps", str(metrics.total_steps))
         results_table.add_row("Average Loss", f"{metrics.avg_loss:.4f}")
         results_table.add_row("Training Time", f"{metrics.training_time_seconds:.1f}s")
+        results_table.add_row("Adapter Saved To", metrics.adapter_path or "N/A")
 
         console.print(results_table)
         console.print("[green]Training complete! Draft model updated.[/green]")
+
+        # Prompt user to save to 'best' folder
+        existing_best_loss = trainer.get_existing_best_loss()
+        if existing_best_loss is not None:
+            comparison = (
+                f"[yellow]Existing best loss: {existing_best_loss:.4f}[/yellow]\n"
+                f"[cyan]Current loss: {metrics.avg_loss:.4f}[/cyan]"
+            )
+            if metrics.avg_loss < existing_best_loss:
+                comparison += " [green](better)[/green]"
+            else:
+                comparison += " [red](worse)[/red]"
+            console.print(Panel(comparison, title="Comparison with Existing Best"))
+
+        if click.confirm("\nSave this adapter to 'best'?", default=True):
+            best_path = trainer.save_to_best()
+            console.print(f"[green]✓ Saved to: {best_path}[/green]")
 
     def evaluate(self, prompts: Optional[List[str]] = None) -> Dict[str, Any]:
         """
@@ -704,7 +722,7 @@ class SpeculativeDecodingSystem:
         Resolve adapter path from user input (supports aliases and paths).
 
         Supports:
-        - Aliases: 'best', 'final', 'latest'
+        - Aliases: 'best', 'latest'
         - Relative paths: data/checkpoints/my_adapter
         - Absolute paths: /full/path/to/adapter
 
@@ -720,8 +738,8 @@ class SpeculativeDecodingSystem:
         checkpoint_dir = Path(self.config["training"]["checkpoint_dir"])
 
         # Handle aliases
-        if path_or_alias.lower() in ["best", "final"]:
-            resolved = checkpoint_dir / path_or_alias.lower()
+        if path_or_alias.lower() == "best":
+            resolved = checkpoint_dir / "best"
         elif path_or_alias.lower() == "latest":
             # Find most recently modified checkpoint directory
             if not checkpoint_dir.exists():
@@ -1051,7 +1069,7 @@ class SpeculativeDecodingSystem:
                 console.print(
                     "[red]Error: /load-adapter requires a path argument[/red]"
                 )
-                console.print("Usage: /load-adapter <path|best|final|latest>")
+                console.print("Usage: /load-adapter <path|best|latest>")
                 return False
 
             try:
@@ -1125,7 +1143,7 @@ class SpeculativeDecodingSystem:
                 "  /train - Train on collected data\n"
                 "  /eval - Run evaluation\n"
                 "  /clear - Clear screen\n"
-                "  /load-adapter <path|best|final|latest> - Load LoRA adapter\n"
+                "  /load-adapter <path|best|latest> - Load LoRA adapter\n"
                 "  /unload-adapter - Unload adapter (revert to base model)\n"
                 "  /adapter-info - Show current adapter details",
                 title="Interactive Mode",
@@ -1527,7 +1545,7 @@ def collect_data(ctx, prompts_file, prompts, max_tokens, limit, output):
     "-a",
     type=str,
     default="best",
-    help="LoRA adapter path or alias (best/final/latest). Default: best",
+    help="LoRA adapter path or alias (best/latest). Default: best",
 )
 @click.option(
     "--skip-lora",
@@ -1567,7 +1585,7 @@ def benchmark_suite(
         python -m src.main benchmark-suite --skip-lora
 
         # Use specific adapter
-        python -m src.main benchmark-suite -a data/checkpoints/final
+        python -m src.main benchmark-suite -a data/checkpoints/best
     """
     from .benchmark import run_benchmark_suite
 
