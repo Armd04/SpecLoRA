@@ -297,6 +297,9 @@ class TestCheckpointFormat:
                 checkpoint_dir=tmpdir,
             )
 
+            # Save checkpoint first
+            trainer.save_checkpoint()
+
             # Fuse LoRA weights (removes LoRA layers from model)
             trainer.fuse_and_get_model()
 
