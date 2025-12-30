@@ -212,7 +212,7 @@ class ManualSpeculativeDecoder:
                 "tokenizer.apply_chat_template() failed during manual decoding."
             ) from exc
 
-    def _sample_token(self, logits: mx.array) -> Tuple[int, float]:
+    def _sample_token(self, logits: mx.array) -> Tuple[int, float, Optional[mx.array]]:
         """
         Sample a token from logits using temperature sampling.
 
@@ -220,7 +220,7 @@ class ManualSpeculativeDecoder:
             logits: Logits of shape [vocab_size]
 
         Returns:
-            Tuple of (token_id, probability)
+            Tuple of (token_id, probability, full_probs or None)
         """
         # Ensure 1D
         if logits.ndim > 1:
@@ -229,21 +229,21 @@ class ManualSpeculativeDecoder:
         if self.temperature == 0:
             # Greedy: probability is 1 for the chosen token
             token = mx.argmax(logits).item()
-            return token, 1.0
+            return token, 1.0, None
 
         # Temperature-scaled sampling and probability from the same distribution
         scaled_logits = logits / self.temperature
         scaled_probs = mx.softmax(scaled_logits, axis=-1)
         token = mx.random.categorical(scaled_logits).item()
         prob = scaled_probs[token].item()
-        return token, prob
+        return token, prob, scaled_probs
 
     def _verify_and_accept(
         self,
         draft_token: int,
         draft_prob: float,
         target_logits: mx.array,
-        draft_logits: mx.array,
+        draft_probs_full: Optional[mx.array],
         debug: bool = False,
     ) -> Tuple[bool, int, float]:
         """
@@ -256,7 +256,7 @@ class ManualSpeculativeDecoder:
             draft_token: Token proposed by draft model
             draft_prob: Probability draft assigned to this token
             target_logits: Target model's logits for this position
-            draft_logits: Draft model's logits for this position (used for residual sampling)
+            draft_probs_full: Draft probability distribution (temp-scaled) for this position
             debug: If True, print debug information
 
         Returns:
@@ -267,8 +267,6 @@ class ManualSpeculativeDecoder:
 
         if target_logits.ndim > 1:
             target_logits = target_logits.reshape(-1)
-        if draft_logits.ndim > 1:
-            draft_logits = draft_logits.reshape(-1)
 
         if self.temperature == 0:
             target_probs = mx.softmax(target_logits, axis=-1)
@@ -293,8 +291,11 @@ class ManualSpeculativeDecoder:
                 return False, target_choice, target_probs[target_choice].item()
         else:
             # Probabilistic acceptance: accept with prob min(1, p_target/p_draft)
-            scaled_draft_logits = draft_logits / self.temperature
-            draft_probs_full = mx.softmax(scaled_draft_logits, axis=-1)
+            if draft_probs_full is None:
+                raise RuntimeError(
+                    "Draft probabilities missing during probabilistic verification. "
+                    "Ensure _sample_token returns the full distribution when temperature > 0."
+                )
             mx.eval(draft_probs_full)
 
             target_vocab = target_probs.shape[-1]
@@ -334,6 +335,13 @@ class ManualSpeculativeDecoder:
                     )
                 elif draft_vocab > target_vocab:
                     draft_probs_aligned = draft_probs_full[:target_vocab]
+                    # Renormalize after truncation so distribution sums to 1
+                    draft_mass = mx.sum(draft_probs_aligned)
+                    mx.eval(draft_mass)
+                    if draft_mass.item() > 0:
+                        draft_probs_aligned = draft_probs_aligned / draft_mass
+                    else:
+                        draft_probs_aligned = mx.zeros_like(target_probs)
                 else:
                     draft_probs_aligned = draft_probs_full
 
@@ -439,7 +447,7 @@ class ManualSpeculativeDecoder:
             # ============================================================
             draft_tokens: List[int] = []
             draft_probs: List[float] = []
-            draft_logits_list: List[mx.array] = []
+            draft_prob_dists: List[Optional[mx.array]] = []
 
             # Save current cache position - we'll rewind after draft generation
             # since draft tokens are speculative
@@ -460,10 +468,10 @@ class ManualSpeculativeDecoder:
                     )
 
                 # Sample from draft model's prediction
-                token, prob = self._sample_token(current_logits)
+                token, prob, prob_dist = self._sample_token(current_logits)
                 draft_tokens.append(token)
                 draft_probs.append(prob)
-                draft_logits_list.append(current_logits)
+                draft_prob_dists.append(prob_dist)
 
                 if token == self.eos_token_id:
                     break
@@ -588,7 +596,7 @@ class ManualSpeculativeDecoder:
                     draft_token,
                     draft_prob,
                     target_logits_for_verify,
-                    draft_logits_list[k],
+                    draft_prob_dists[k],
                     debug=should_debug,
                 )
 
