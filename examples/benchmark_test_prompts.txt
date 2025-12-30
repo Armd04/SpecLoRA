@@ -1,9 +1,34 @@
-# Test prompts for benchmark suite verification
-# These are short prompts to verify the benchmark works correctly
+# Benchmark prompts for SpecLoRA evaluation
+# These prompts test the same domains as training data but are shorter for faster benchmarking
 
-What is Python?
+# Data Structures - Quick implementations
+Implement a basic stack using a Python list with push, pop, and peek methods.
 
-Explain machine learning in one sentence.
+Write a function to reverse a linked list iteratively in Python.
 
-Write a simple "Hello World" program.
+Implement binary search on a sorted array. Return the index or -1 if not found.
+
+# Algorithms - Core concepts
+Write a function to check if a string has all unique characters without using extra data structures.
+
+Implement BFS traversal for a graph represented as an adjacency list.
+
+Write a function to find the maximum subarray sum using Kadane's algorithm.
+
+# ML/AI - Conceptual understanding
+Explain the difference between L1 and L2 regularization and when to use each.
+
+What is the softmax function and why is it used in classification tasks? Show the formula.
+
+Explain why we use mini-batch gradient descent instead of full batch or pure stochastic.
+
+# Complexity & Theory
+What is the time complexity of inserting into a balanced BST? Explain why.
+
+Compare the space complexity of BFS vs DFS for tree traversal.
+
+# Systems Programming - Short examples
+Write a Python context manager for timing code execution.
+
+Explain the difference between a mutex and a semaphore with a brief example.
 
