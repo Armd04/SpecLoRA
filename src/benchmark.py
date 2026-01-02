@@ -439,20 +439,38 @@ def display_results(summary: BenchmarkSummary) -> None:
         console.print("\n[bold]Per-Prompt Results (first 5):[/bold]")
         detail_table = Table(show_header=True, border_style="dim")
         detail_table.add_column("Prompt", style="dim", no_wrap=False, max_width=40)
-        detail_table.add_column("Target", justify="right")
-        detail_table.add_column("Base", justify="right")
-        detail_table.add_column("LoRA", justify="right")
+        detail_table.add_column("Target\nTok/s", justify="right")
+        detail_table.add_column("Base\nTok/s (Acc%)", justify="right")
+        detail_table.add_column("LoRA\nTok/s (Acc%)", justify="right")
 
         for i, prompt_data in enumerate(summary.per_prompt[:5]):
             target_tps = prompt_data.get("target_only", {}).get("tokens_per_second", 0)
             base_tps = prompt_data.get("spec_base", {}).get("tokens_per_second", 0)
+            base_acc = prompt_data.get("spec_base", {}).get("acceptance_rate")
             lora_tps = prompt_data.get("spec_lora", {}).get("tokens_per_second", 0)
+            lora_acc = prompt_data.get("spec_lora", {}).get("acceptance_rate")
+
+            # Format Base column with acceptance rate
+            if base_tps:
+                base_str = f"{base_tps:.1f}"
+                if base_acc is not None:
+                    base_str += f" ({base_acc:.0%})"
+            else:
+                base_str = "-"
+
+            # Format LoRA column with acceptance rate
+            if lora_tps:
+                lora_str = f"{lora_tps:.1f}"
+                if lora_acc is not None:
+                    lora_str += f" ({lora_acc:.0%})"
+            else:
+                lora_str = "-"
 
             detail_table.add_row(
                 prompt_data["prompt"],
                 f"{target_tps:.1f}" if target_tps else "-",
-                f"{base_tps:.1f}" if base_tps else "-",
-                f"{lora_tps:.1f}" if lora_tps else "-",
+                base_str,
+                lora_str,
             )
 
         console.print(detail_table)
