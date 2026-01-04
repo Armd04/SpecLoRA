@@ -147,6 +147,7 @@ class ManualSpeculativeDecoder:
         acceptance_threshold: float = 0.5,
         context_window: int = 16,
         system_message: Optional[str] = None,
+        top_k_logits: int = 10,
     ):
         """
         Initialize the manual speculative decoder.
@@ -161,6 +162,7 @@ class ManualSpeculativeDecoder:
             acceptance_threshold: Below this acceptance rate = failure case
             context_window: Number of context tokens to include in disagreements
             system_message: System message for chat formatting
+            top_k_logits: Number of top logits to store per disagreement for KL distillation
         """
         self.target_model = target_model
         self.draft_model = draft_model
@@ -171,6 +173,10 @@ class ManualSpeculativeDecoder:
         self.acceptance_threshold = acceptance_threshold
         self.context_window = context_window
         self.system_message = system_message or "You are a helpful assistant."
+        self.top_k_logits = top_k_logits
+        # Distillation temperature (default 2.0, should match training.loss.temperature)
+        # This is separate from sampling temperature and is used for extracting target logits
+        self.distillation_temperature = getattr(self, "distillation_temperature", 2.0)
 
         if not hasattr(self.tokenizer, "apply_chat_template") or not callable(
             self.tokenizer.apply_chat_template
@@ -237,6 +243,43 @@ class ManualSpeculativeDecoder:
         token = mx.random.categorical(scaled_logits).item()
         prob = scaled_probs[token].item()
         return token, prob, scaled_probs
+
+    def _extract_top_k_logits(
+        self, logits: mx.array, k: int, temperature: float = 1.0
+    ) -> List[Tuple[int, float]]:
+        """
+        Extract top-k logits as (token_id, probability) tuples.
+
+        Args:
+            logits: Logits array of shape [vocab_size]
+            k: Number of top logits to extract
+            temperature: Temperature for scaling logits before softmax (default 1.0)
+
+        Returns:
+            List of (token_id, probability) tuples, sorted by probability descending
+        """
+        # Ensure 1D
+        if logits.ndim > 1:
+            logits = logits.reshape(-1)
+
+        # Apply temperature BEFORE softmax (consistent with KL divergence computation)
+        scaled_logits = logits / temperature
+        probs = mx.softmax(scaled_logits, axis=-1)
+        mx.eval(probs)
+
+        # Get top-k indices and values
+        k = min(k, probs.shape[-1])
+        top_k_indices = mx.argsort(probs, axis=-1)[-k:][::-1]  # Descending order
+        top_k_values = mx.take(probs, top_k_indices, axis=-1)
+
+        mx.eval(top_k_indices, top_k_values)
+
+        # Convert to list of tuples
+        result = [
+            (int(top_k_indices[i].item()), float(top_k_values[i].item()))
+            for i in range(k)
+        ]
+        return result
 
     def _verify_and_accept(
         self,
@@ -612,6 +655,15 @@ class ManualSpeculativeDecoder:
                     )
                     context = full_sequence_before_disagreement[context_start:]
 
+                    # Extract top-k target logits for KL distillation
+                    # Use distillation_temperature (default 2.0) to match training-time temperature scaling
+                    # This ensures consistent probability distributions for KL divergence computation
+                    target_logits_topk = self._extract_top_k_logits(
+                        target_logits_for_verify,
+                        self.top_k_logits,
+                        temperature=self.distillation_temperature,
+                    )
+
                     disagreement = TokenLevelDisagreement(
                         position=len(all_tokens) + k,
                         draft_token=draft_token,
@@ -619,6 +671,7 @@ class ManualSpeculativeDecoder:
                         draft_confidence=draft_prob,
                         target_confidence=target_prob,
                         context_tokens=context,
+                        target_logits=target_logits_topk,
                     )
                     disagreements.append(disagreement)
                     metrics.num_disagreements += 1

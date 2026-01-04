@@ -385,8 +385,13 @@ class SpeculativeDecodingSystem:
 
         max_tokens = max_tokens or self.config["speculative"]["max_tokens"]
 
-        # Create manual decoder
-        manual_decoder = self.decoder.create_manual_decoder()
+        # Create manual decoder with top_k_logits and distillation_temperature from config
+        loss_config = self.config["training"].get("loss", {})
+        top_k_logits = loss_config.get("top_k_logits", 10)
+        distillation_temp = loss_config.get("temperature", 2.0)
+        manual_decoder = self.decoder.create_manual_decoder(
+            top_k_logits=top_k_logits, distillation_temperature=distillation_temp
+        )
 
         console.print(f"[cyan]Collecting data from {len(prompts)} prompts...[/cyan]")
 
@@ -521,7 +526,7 @@ class SpeculativeDecodingSystem:
         if not self._initialized:
             self.initialize()
 
-        from .training import LoRATrainer, LoRAConfig
+        from .training import LoRATrainer, LoRAConfig, LossConfig
 
         num_epochs = num_epochs or self.config["training"]["num_epochs"]
 
@@ -552,6 +557,15 @@ class SpeculativeDecodingSystem:
             alpha=self.config["training"]["lora"]["alpha"],
             dropout=self.config["training"]["lora"]["dropout"],
             target_modules=self.config["training"]["lora"]["target_modules"],
+        )
+
+        # Setup loss config
+        loss_config_dict = self.config["training"].get("loss", {})
+        loss_config = LossConfig(
+            type=loss_config_dict.get("type", "cross_entropy"),
+            temperature=loss_config_dict.get("temperature", 2.0),
+            alpha=loss_config_dict.get("alpha", 0.5),
+            top_k_logits=loss_config_dict.get("top_k_logits", 10),
         )
 
         # Get draft model
@@ -600,6 +614,7 @@ class SpeculativeDecodingSystem:
             ],
             warmup_steps=self.config["training"]["warmup_steps"],
             checkpoint_dir=self.config["training"]["checkpoint_dir"],
+            loss_config=loss_config,
         )
 
         console.print("[cyan]Starting LoRA training...[/cyan]")
@@ -1334,8 +1349,13 @@ def benchmark(ctx, prompt, iterations, max_tokens, implementation):
 
     import time
 
-    # Create manual decoder if needed
-    manual_decoder = system.decoder.create_manual_decoder()
+    # Create manual decoder if needed with top_k_logits and distillation_temperature from config
+    loss_config = ctx.obj["config"]["training"].get("loss", {})
+    top_k_logits = loss_config.get("top_k_logits", 10)
+    distillation_temp = loss_config.get("temperature", 2.0)
+    manual_decoder = system.decoder.create_manual_decoder(
+        top_k_logits=top_k_logits, distillation_temperature=distillation_temp
+    )
 
     # Warm up
     console.print("[cyan]Warming up...[/cyan]")

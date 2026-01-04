@@ -342,6 +342,156 @@ class TrainingMetrics:
         }
 
 
+@dataclass
+class LossConfig:
+    """Configuration for loss function selection and parameters."""
+
+    type: str = "cross_entropy"  # "cross_entropy" | "kl_divergence" | "mixed"
+    temperature: float = 2.0  # Temperature for softening distributions in KL
+    alpha: float = 0.5  # Weight for mixed loss: alpha * CE + (1-alpha) * KL
+    top_k_logits: int = 10  # Number of top logits stored per disagreement
+
+
+def cross_entropy_loss(
+    student_logits: mx.array,
+    target_ids: mx.array,
+    mask: mx.array,
+) -> mx.array:
+    """
+    Compute cross-entropy loss between student logits and hard targets.
+
+    Args:
+        student_logits: Student model logits [batch*seq_len, vocab_size]
+        target_ids: Target token IDs [batch*seq_len]
+        mask: Boolean mask for valid positions [batch*seq_len]
+
+    Returns:
+        Scalar loss value
+    """
+    num_valid = mask.sum()
+    if num_valid == 0:
+        return mx.array(float("nan"))
+
+    # Replace masked positions with 0 for gathering
+    targets = mx.where(mask, target_ids, mx.zeros_like(target_ids))
+
+    # Cross-entropy with numerical stability
+    logits_max = mx.max(student_logits, axis=-1, keepdims=True)
+    logits_stable = student_logits - mx.stop_gradient(logits_max)
+    log_probs = logits_stable - mx.logsumexp(logits_stable, axis=-1, keepdims=True)
+
+    # Gather log probabilities for target tokens
+    target_log_probs = mx.take_along_axis(
+        log_probs,
+        targets[:, None],
+        axis=-1,
+    ).squeeze(-1)
+
+    # Clamp to avoid extreme values
+    target_log_probs = mx.clip(target_log_probs, a_min=-100.0, a_max=0.0)
+
+    # Apply mask and compute mean loss
+    masked_loss = -target_log_probs * mask
+    loss = masked_loss.sum() / num_valid
+
+    return loss
+
+
+def kl_divergence_loss(
+    student_logits: mx.array,
+    target_logits_sparse: Dict[int, Dict[int, float]],
+    positions: mx.array,
+    temperature: float,
+    vocab_size: int,
+) -> mx.array:
+    """
+    Compute KL divergence loss between student and target distributions.
+
+    Uses sparse target logits (only top-k values known) and temperature scaling.
+    Computes KL per position and averages over valid positions.
+
+    Args:
+        student_logits: Student model logits [batch*seq_len, vocab_size]
+        target_logits_sparse: Dict mapping flat_idx -> {token_id: prob} (sparse, top-k only)
+        positions: Boolean mask indicating positions where KL should be computed
+        temperature: Temperature for softening distributions
+        vocab_size: Vocabulary size
+
+    Returns:
+        Scalar KL divergence loss
+    """
+    num_valid = positions.sum()
+    if num_valid == 0:
+        return mx.array(float("nan"))
+
+    # Temperature-scale student logits and compute softmax
+    scaled_student_logits = student_logits / temperature
+    student_probs = mx.softmax(scaled_student_logits, axis=-1)
+
+    # Compute KL divergence per position (build as Python list to avoid MLX array mutation)
+    kl_per_position_list = [0.0] * student_logits.shape[0]
+
+    for flat_idx, target_logits_dict in target_logits_sparse.items():
+        # Defensive bounds checking
+        if (
+            flat_idx >= student_logits.shape[0]
+            or flat_idx >= positions.shape[0]
+            or not positions[flat_idx]
+        ):
+            continue
+
+        # Get student probabilities for this position
+        student_probs_pos = student_probs[flat_idx, :]
+
+        # Build sparse target distribution for this position
+        # Build as Python list first to avoid MLX array mutation
+        # Don't renormalize - use probabilities as-is to avoid artificially inflating them
+        target_probs_list = [0.0] * vocab_size
+        for token_id, prob in target_logits_dict.items():
+            if 0 <= token_id < vocab_size:
+                target_probs_list[token_id] = prob
+
+        target_probs_pos = mx.array(target_probs_list)
+
+        # Compute KL(target || student) for this position
+        # Only compute over positions where we have target probabilities (sparse KL)
+        # This is an approximation but avoids bias from renormalization
+        eps = 1e-10
+        mask_known = target_probs_pos > 0
+        kl_pos = mx.sum(
+            mask_known
+            * target_probs_pos
+            * (mx.log(target_probs_pos + eps) - mx.log(student_probs_pos + eps))
+        )
+
+        # Store as Python float to avoid keeping MLX computation graph in memory
+        kl_per_position_list[flat_idx] = kl_pos.item()
+
+    # Convert to MLX array
+    kl_per_position = mx.array(kl_per_position_list)
+
+    # Average over valid positions
+    masked_kl = kl_per_position * positions
+    loss = masked_kl.sum() / num_valid
+
+    return loss
+
+
+def mixed_loss(ce_loss: mx.array, kl_loss: mx.array, alpha: float) -> mx.array:
+    """
+    Compute mixed loss combining cross-entropy and KL divergence.
+
+    Args:
+        ce_loss: Cross-entropy loss value
+        kl_loss: KL divergence loss value
+        alpha: Weight for CE (alpha * CE + (1-alpha) * KL)
+
+    Returns:
+        Combined loss value
+    """
+    return alpha * ce_loss + (1 - alpha) * kl_loss
+
+
 class LoRATrainer:
     """
     Trainer for LoRA fine-tuning of the draft model.
@@ -361,6 +511,7 @@ class LoRATrainer:
         warmup_steps: int = 10,
         max_grad_norm: float = 1.0,
         checkpoint_dir: str = "data/checkpoints",
+        loss_config: Optional[LossConfig] = None,
     ):
         """
         Initialize the trainer.
@@ -375,6 +526,7 @@ class LoRATrainer:
             warmup_steps: LR warmup steps
             max_grad_norm: Maximum gradient norm for clipping
             checkpoint_dir: Directory for saving checkpoints
+            loss_config: Loss function configuration (defaults to cross_entropy)
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -386,6 +538,7 @@ class LoRATrainer:
         self.max_grad_norm = max_grad_norm
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.loss_config = loss_config or LossConfig()  # Default to cross_entropy
 
         # Unique run ID for this training session (Unix timestamp)
         self._run_id = int(time.time())
@@ -507,7 +660,7 @@ class LoRATrainer:
     def _prepare_batch(
         self,
         examples: List[TrainingExample],
-    ) -> Tuple[mx.array, mx.array]:
+    ) -> Tuple[mx.array, mx.array, Optional[List[Dict[int, Dict[int, float]]]]]:
         """
         Prepare a training batch from examples.
 
@@ -529,12 +682,20 @@ class LoRATrainer:
             examples: List of training examples
 
         Returns:
-            Tuple of (input_ids, target_ids) as MLX arrays
+            Tuple of (input_ids, target_ids, disagreement_logits) where:
+            - input_ids: [batch, seq_len] MLX array
+            - target_ids: [batch, seq_len] MLX array
+            - disagreement_logits: Optional list of dicts, one per example.
+              Each dict maps relative position in sequence (0-indexed) to target_logits dict.
+              Only included if loss_config requires KL divergence.
         """
         max_length = 512  # Configurable
 
         input_ids_list = []
         target_ids_list = []
+        disagreement_logits_list = (
+            [] if self.loss_config.type in ("kl_divergence", "mixed") else None
+        )
 
         for ex in examples:
             # Prefer the exact prompt tokens used during generation (formatted chat prompt).
@@ -651,8 +812,26 @@ class LoRATrainer:
                 full_input = full_input[:max_length]
                 targets = targets[:max_length]
 
+            # Collect disagreement logits if needed for KL loss
+            example_disagreement_logits = {}
+            if disagreement_logits_list is not None and ex.disagreements:
+                for d in ex.disagreements:
+                    # Disagreement position is absolute in full_sequence
+                    # Map to relative position in targets (which is shifted by 1)
+                    # Only include if position is in generation part (>= prompt_len)
+                    if d.position >= prompt_len:
+                        # Relative position in targets: pos - 1 (due to shift)
+                        rel_pos = d.position - 1
+                        # Only include if within sequence length and has target_logits
+                        if rel_pos < len(targets) and d.target_logits:
+                            # Convert list of tuples to dict for easier lookup
+                            target_logits_dict = dict(d.target_logits)
+                            example_disagreement_logits[rel_pos] = target_logits_dict
+
             input_ids_list.append(full_input)
             target_ids_list.append(targets)
+            if disagreement_logits_list is not None:
+                disagreement_logits_list.append(example_disagreement_logits)
 
         # Handle case where all examples were skipped
         if len(input_ids_list) == 0:
@@ -661,11 +840,15 @@ class LoRATrainer:
             return (
                 mx.array([], dtype=mx.int32).reshape(0, max_length),
                 mx.array([], dtype=mx.int32).reshape(0, max_length),
+                disagreement_logits_list
+                if disagreement_logits_list is not None
+                else None,
             )
 
         return (
             mx.array(input_ids_list),
             mx.array(target_ids_list),
+            disagreement_logits_list if disagreement_logits_list is not None else None,
         )
 
     def _compute_loss(
@@ -673,14 +856,17 @@ class LoRATrainer:
         model: nn.Module,
         input_ids: mx.array,
         target_ids: mx.array,
+        disagreement_logits: Optional[List[Dict[int, Dict[int, float]]]] = None,
     ) -> mx.array:
         """
-        Compute cross-entropy loss.
+        Compute loss based on configured loss type.
 
         Args:
             model: The model to compute loss for (passed by nn.value_and_grad)
             input_ids: Input token IDs [batch, seq_len]
             target_ids: Target token IDs [batch, seq_len]
+            disagreement_logits: Optional list of dicts mapping positions to target logits
+                for KL divergence. One dict per example in batch.
 
         Returns:
             Scalar loss value
@@ -688,13 +874,13 @@ class LoRATrainer:
         # Forward pass
         logits = model(input_ids)
 
-        # Reshape for cross-entropy
+        # Reshape for loss computation
         batch_size, seq_len, vocab_size = logits.shape
-        logits = logits.reshape(-1, vocab_size)
-        targets = target_ids.reshape(-1)
+        logits_flat = logits.reshape(-1, vocab_size)
+        targets_flat = target_ids.reshape(-1)
 
         # Create mask for non-padding tokens (targets == -100 are masked)
-        mask = targets != -100
+        mask = targets_flat != -100
 
         # Check if we have any valid targets
         num_valid = mask.sum()
@@ -703,34 +889,71 @@ class LoRATrainer:
                 "No valid targets in batch (all masked with -100). "
                 "This batch will be skipped."
             )
-            # Return NaN so the training loop skips this batch
-            # (consistent with how NaN losses from numerical instability are handled)
             return mx.array(float("nan"))
 
-        # Replace masked positions with 0 (arbitrary valid index for gathering)
-        targets = mx.where(mask, targets, mx.zeros_like(targets))
+        # Always compute cross-entropy loss
+        ce_loss = cross_entropy_loss(logits_flat, targets_flat, mask)
 
-        # Cross-entropy loss with numerical stability
-        # Subtract max for numerical stability before softmax
-        logits_max = mx.max(logits, axis=-1, keepdims=True)
-        logits_stable = logits - mx.stop_gradient(logits_max)
-        log_probs = logits_stable - mx.logsumexp(logits_stable, axis=-1, keepdims=True)
+        # Compute KL divergence loss if needed
+        loss_type = self.loss_config.type
+        if loss_type == "cross_entropy":
+            return ce_loss
+        elif loss_type in ("kl_divergence", "mixed"):
+            # Check if we have disagreement logits
+            if disagreement_logits is None or not any(
+                d for d in disagreement_logits if d
+            ):
+                # Fall back to CE if no logits available
+                if loss_type == "kl_divergence":
+                    logger.warning(
+                        "KL divergence requested but no target logits available. "
+                        "Falling back to cross-entropy loss."
+                    )
+                return ce_loss
 
-        # Gather the log probabilities for target tokens
-        target_log_probs = mx.take_along_axis(
-            log_probs,
-            targets[:, None],
-            axis=-1,
-        ).squeeze(-1)
+            # Build position mask and sparse target logits for KL
+            # disagreement_logits[i] maps relative position -> {token_id: prob}
+            # Build as Python list first (MLX arrays are immutable)
+            kl_positions_list = [False] * len(mask)
+            all_target_logits_sparse: Dict[int, Dict[int, float]] = {}
 
-        # Clamp to avoid extreme values
-        target_log_probs = mx.clip(target_log_probs, a_min=-100.0, a_max=0.0)
+            for batch_idx in range(batch_size):
+                example_logits = (
+                    disagreement_logits[batch_idx]
+                    if batch_idx < len(disagreement_logits)
+                    else {}
+                )
+                for rel_pos, target_logits_dict in example_logits.items():
+                    # Convert relative position to flat index
+                    flat_idx = batch_idx * seq_len + rel_pos
+                    if flat_idx < len(kl_positions_list) and mask[flat_idx]:
+                        kl_positions_list[flat_idx] = True
+                        # Store target logits for this position
+                        all_target_logits_sparse[flat_idx] = target_logits_dict
 
-        # Apply mask and compute mean loss over valid positions only
-        masked_loss = -target_log_probs * mask
-        loss = masked_loss.sum() / num_valid
+            # Convert to MLX array
+            kl_positions = mx.array(kl_positions_list)
 
-        return loss
+            # Compute KL loss if we have any positions
+            kl_num_valid = kl_positions.sum()
+            if kl_num_valid > 0:
+                kl_loss = kl_divergence_loss(
+                    logits_flat,
+                    all_target_logits_sparse,
+                    kl_positions,
+                    self.loss_config.temperature,
+                    vocab_size,
+                )
+            else:
+                # No valid KL positions, use CE only
+                kl_loss = ce_loss
+
+            if loss_type == "kl_divergence":
+                return kl_loss
+            else:  # mixed
+                return mixed_loss(ce_loss, kl_loss, self.loss_config.alpha)
+        else:
+            raise ValueError(f"Unknown loss type: {loss_type}")
 
     def _filter_lora_gradients(self, grads: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -776,6 +999,7 @@ class LoRATrainer:
         self,
         input_ids: mx.array,
         target_ids: mx.array,
+        disagreement_logits: Optional[List[Dict[int, Dict[int, float]]]] = None,
     ) -> Tuple[float, Dict[str, mx.array]]:
         """
         Perform a single training step.
@@ -783,6 +1007,7 @@ class LoRATrainer:
         Args:
             input_ids: Input batch
             target_ids: Target batch
+            disagreement_logits: Optional disagreement logits for KL loss
 
         Returns:
             Tuple of (loss_value, gradients)
@@ -790,7 +1015,7 @@ class LoRATrainer:
 
         # Create a loss function that we can differentiate
         def loss_fn(model):
-            return self._compute_loss(model, input_ids, target_ids)
+            return self._compute_loss(model, input_ids, target_ids, disagreement_logits)
 
         # Compute loss and gradients
         loss, grads = nn.value_and_grad(self.model, loss_fn)(self.model)
@@ -842,6 +1067,34 @@ class LoRATrainer:
             f"{num_epochs} epochs, {total_steps} total steps"
         )
 
+        # Validate that target_logits exist if KL loss is requested
+        if self.loss_config.type in ("kl_divergence", "mixed"):
+            examples_with_logits = sum(
+                1
+                for ex in training_examples
+                if ex.disagreements
+                and any(d.target_logits for d in ex.disagreements if d.target_logits)
+            )
+            logits_ratio = examples_with_logits / max(num_examples, 1)
+
+            if examples_with_logits == 0:
+                raise ValueError(
+                    f"Loss type '{self.loss_config.type}' requires target logits, "
+                    "but no examples have target_logits. "
+                    "Ensure data was collected with --mode detailed and includes target logits."
+                )
+            elif logits_ratio < 0.5:
+                logger.warning(
+                    f"Only {logits_ratio:.1%} of examples have target logits. "
+                    f"KL divergence may be less effective. "
+                    "Consider collecting more data with --mode detailed."
+                )
+            else:
+                logger.info(
+                    f"Using {self.loss_config.type} loss: "
+                    f"{examples_with_logits}/{num_examples} examples have target logits"
+                )
+
         accumulated_grads = None
         accumulated_loss = 0.0
         valid_steps_in_accumulation = 0  # Track how many valid steps we've accumulated
@@ -866,14 +1119,18 @@ class LoRATrainer:
                     continue
 
                 # Prepare batch
-                input_ids, target_ids = self._prepare_batch(batch_examples)
+                input_ids, target_ids, disagreement_logits = self._prepare_batch(
+                    batch_examples
+                )
 
                 # Skip empty batches (can happen if all examples were filtered out)
                 if input_ids.shape[0] == 0:
                     continue
 
                 # Training step
-                loss, grads = self._training_step(input_ids, target_ids)
+                loss, grads = self._training_step(
+                    input_ids, target_ids, disagreement_logits
+                )
 
                 # Check for NaN/Inf in loss
                 if not mx.isfinite(mx.array(loss)).item():

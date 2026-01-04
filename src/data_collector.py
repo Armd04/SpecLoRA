@@ -15,7 +15,7 @@ import random
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Dict, Any, TYPE_CHECKING
+from typing import List, Optional, Dict, Any, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .speculative import SpeculativeResult
@@ -50,13 +50,29 @@ class TokenLevelDisagreement:
     # Last N tokens before this position (context for understanding failure)
     context_tokens: List[int] = field(default_factory=list)
 
+    # Top-k target logits for KL distillation (optional, for backward compat)
+    # Format: List of (token_id, probability) tuples, sorted by probability desc
+    target_logits: Optional[List[Tuple[int, float]]] = None
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
-        return asdict(self)
+        result = asdict(self)
+        # Convert target_logits tuples to list of lists for JSON serialization
+        if result.get("target_logits") is not None:
+            result["target_logits"] = [
+                [tid, prob] for tid, prob in result["target_logits"]
+            ]
+        return result
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TokenLevelDisagreement":
         """Create from dictionary."""
+        # Handle backward compatibility: missing target_logits = None
+        if "target_logits" in data and data["target_logits"] is not None:
+            # Convert list of lists back to list of tuples
+            data["target_logits"] = [
+                tuple(logit_pair) for logit_pair in data["target_logits"]
+            ]
         return cls(**data)
 
     @property

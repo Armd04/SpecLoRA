@@ -68,6 +68,13 @@ training:
   # Checkpointing
   save_every_n_steps: 50
   checkpoint_dir: "data/checkpoints"
+  
+  # Loss function configuration
+  loss:
+    type: "kl_divergence"  # "cross_entropy" | "kl_divergence" | "mixed"
+    temperature: 2.0        # Softens distributions for KL (higher = softer)
+    alpha: 0.5             # For mixed: alpha * CE + (1-alpha) * KL
+    top_k_logits: 10       # Number of top logits to store per disagreement
 
 # Data Collection
 data:

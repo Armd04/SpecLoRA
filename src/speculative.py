@@ -350,7 +350,9 @@ class SpeculativeDecoder:
 
         return generated_text, elapsed, num_generated
 
-    def create_manual_decoder(self) -> "ManualSpeculativeDecoder":
+    def create_manual_decoder(
+        self, top_k_logits: int = 10, distillation_temperature: float = 2.0
+    ) -> "ManualSpeculativeDecoder":
         """
         Create a ManualSpeculativeDecoder with the same configuration.
 
@@ -360,12 +362,17 @@ class SpeculativeDecoder:
 
         Use this for data collection runs, not production inference.
 
+        Args:
+            top_k_logits: Number of top logits to store per disagreement for KL distillation
+            distillation_temperature: Temperature for extracting target logits (should match
+                training.loss.temperature in config for consistent KL divergence)
+
         Returns:
             ManualSpeculativeDecoder configured with same models and settings
         """
         from .speculative_manual import ManualSpeculativeDecoder
 
-        return ManualSpeculativeDecoder(
+        decoder = ManualSpeculativeDecoder(
             target_model=self.target_model,
             draft_model=self.draft_model,
             tokenizer=self.tokenizer,
@@ -374,7 +381,11 @@ class SpeculativeDecoder:
             top_p=self.top_p,
             acceptance_threshold=self.acceptance_threshold,
             system_message=self.system_message,
+            top_k_logits=top_k_logits,
         )
+        # Store distillation temperature for use when extracting logits
+        decoder.distillation_temperature = distillation_temperature
+        return decoder
 
     def generate_detailed(
         self,
