@@ -382,9 +382,8 @@ class SpeculativeDecoder:
             acceptance_threshold=self.acceptance_threshold,
             system_message=self.system_message,
             top_k_logits=top_k_logits,
+            distillation_temperature=distillation_temperature,
         )
-        # Store distillation temperature for use when extracting logits
-        decoder.distillation_temperature = distillation_temperature
         return decoder
 
     def generate_detailed(

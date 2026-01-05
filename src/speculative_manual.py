@@ -148,6 +148,7 @@ class ManualSpeculativeDecoder:
         context_window: int = 16,
         system_message: Optional[str] = None,
         top_k_logits: int = 10,
+        distillation_temperature: float = 2.0,
     ):
         """
         Initialize the manual speculative decoder.
@@ -163,6 +164,8 @@ class ManualSpeculativeDecoder:
             context_window: Number of context tokens to include in disagreements
             system_message: System message for chat formatting
             top_k_logits: Number of top logits to store per disagreement for KL distillation
+            distillation_temperature: Temperature for extracting target logits (should match
+                training.loss.temperature in config for consistent KL divergence)
         """
         self.target_model = target_model
         self.draft_model = draft_model
@@ -174,9 +177,7 @@ class ManualSpeculativeDecoder:
         self.context_window = context_window
         self.system_message = system_message or "You are a helpful assistant."
         self.top_k_logits = top_k_logits
-        # Distillation temperature (default 2.0, should match training.loss.temperature)
-        # This is separate from sampling temperature and is used for extracting target logits
-        self.distillation_temperature = getattr(self, "distillation_temperature", 2.0)
+        self.distillation_temperature = distillation_temperature
 
         if not hasattr(self.tokenizer, "apply_chat_template") or not callable(
             self.tokenizer.apply_chat_template

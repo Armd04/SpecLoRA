@@ -436,7 +436,7 @@ def kl_divergence_loss(
         if (
             flat_idx >= student_logits.shape[0]
             or flat_idx >= positions.shape[0]
-            or not positions[flat_idx]
+            or not positions[flat_idx].item()
         ):
             continue
 
@@ -926,7 +926,7 @@ class LoRATrainer:
                 for rel_pos, target_logits_dict in example_logits.items():
                     # Convert relative position to flat index
                     flat_idx = batch_idx * seq_len + rel_pos
-                    if flat_idx < len(kl_positions_list) and mask[flat_idx]:
+                    if flat_idx < len(kl_positions_list) and mask[flat_idx].item():
                         kl_positions_list[flat_idx] = True
                         # Store target logits for this position
                         all_target_logits_sparse[flat_idx] = target_logits_dict
@@ -935,7 +935,7 @@ class LoRATrainer:
             kl_positions = mx.array(kl_positions_list)
 
             # Compute KL loss if we have any positions
-            kl_num_valid = kl_positions.sum()
+            kl_num_valid = kl_positions.sum().item()
             if kl_num_valid > 0:
                 kl_loss = kl_divergence_loss(
                     logits_flat,
