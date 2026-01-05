@@ -445,7 +445,16 @@ def kl_divergence_loss(
 
         # Build sparse target distribution for this position
         # Build as Python list first to avoid MLX array mutation
-        # Don't renormalize - use probabilities as-is to avoid artificially inflating them
+        #
+        # IMPORTANT: The probabilities in target_logits_dict are the TRUE probabilities
+        # from the full softmax distribution (computed in _extract_top_k_logits), NOT
+        # probabilities renormalized among just the top-k tokens. This means:
+        # - The stored probs correctly represent the probability mass for each token
+        # - The sum of top-k probs is typically < 1.0 (the remaining mass is on other tokens)
+        # - We do NOT renormalize because that would artificially inflate probabilities
+        #
+        # The sparse KL computation below only sums over known positions, which is
+        # mathematically valid as a truncated KL divergence approximation.
         target_probs_list = [0.0] * vocab_size
         for token_id, prob in target_logits_dict.items():
             if 0 <= token_id < vocab_size:
@@ -454,8 +463,9 @@ def kl_divergence_loss(
         target_probs_pos = mx.array(target_probs_list)
 
         # Compute KL(target || student) for this position
-        # Only compute over positions where we have target probabilities (sparse KL)
-        # This is an approximation but avoids bias from renormalization
+        # Sparse/truncated KL: only sum over tokens where we have target probabilities
+        # KL_truncated = sum_{i in top-k} [ p_target[i] * log(p_target[i] / p_student[i]) ]
+        # This is a valid lower bound on the true KL and avoids bias from renormalization
         eps = 1e-10
         mask_known = target_probs_pos > 0
         kl_pos = mx.sum(
@@ -813,18 +823,35 @@ class LoRATrainer:
                 targets = targets[:max_length]
 
             # Collect disagreement logits if needed for KL loss
+            # Position mapping explanation:
+            #
+            # In ManualSpeculativeDecoder, disagreement.position is the ABSOLUTE position
+            # in the full sequence where the disagreement occurred.
+            #
+            # Example: prompt=[p0,p1,p2], generation=[g0,g1,g2]
+            #   full_sequence = [p0, p1, p2, g0, g1, g2]  (indices 0-5)
+            #   If disagreement at position 4, that's g1
+            #
+            # In teacher forcing:
+            #   input  = [p0, p1, p2, g0, g1]     (indices 0-4)
+            #   targets= [p1, p2, g0, g1, g2]     (indices 0-4, shifted by 1)
+            #
+            # So targets[i] = full_sequence[i+1], meaning:
+            #   To find the target at full_sequence position P, look at targets[P-1]
+            #
+            # Therefore: rel_pos = d.position - 1
             example_disagreement_logits = {}
             if disagreement_logits_list is not None and ex.disagreements:
                 for d in ex.disagreements:
-                    # Disagreement position is absolute in full_sequence
-                    # Map to relative position in targets (which is shifted by 1)
-                    # Only include if position is in generation part (>= prompt_len)
+                    # Only include generation positions (not prompt-to-prompt)
+                    # Disagreements at position < prompt_len would be in the prompt,
+                    # which is masked anyway
                     if d.position >= prompt_len:
-                        # Relative position in targets: pos - 1 (due to shift)
+                        # Map absolute position to targets array index
                         rel_pos = d.position - 1
-                        # Only include if within sequence length and has target_logits
-                        if rel_pos < len(targets) and d.target_logits:
-                            # Convert list of tuples to dict for easier lookup
+                        # Bounds check: ensure rel_pos is valid (non-negative and within array)
+                        # Note: rel_pos could be -1 if prompt_len=0 and d.position=0
+                        if 0 <= rel_pos < len(targets) and d.target_logits:
                             target_logits_dict = dict(d.target_logits)
                             example_disagreement_logits[rel_pos] = target_logits_dict
 

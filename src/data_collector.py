@@ -257,6 +257,8 @@ class DataCollector:
             True if training should be triggered
         """
         # Create training example
+        # Note: disagreements contains token-level data including target_logits
+        # needed for KL divergence loss training
         example = TrainingExample(
             id=self._generate_id(),
             prompt=result.prompt,
@@ -270,6 +272,7 @@ class DataCollector:
                 "total_tokens": result.metrics.total_tokens_generated,
                 "tokens_per_second": result.metrics.tokens_per_second,
             },
+            disagreements=getattr(result, "disagreements", None),
         )
 
         if result.is_failure_case:

@@ -107,6 +107,13 @@ class ManualSpeculativeResult:
     # Whether this is considered a failure case
     is_failure_case: bool = False
 
+    # Tokenized prompt as used during generation (for training consistency).
+    # This should be the token IDs of the FULL formatted chat prompt
+    # (i.e., after tokenizer.apply_chat_template(..., add_generation_prompt=True)).
+    # IMPORTANT: This must match what was used during generation to ensure
+    # disagreement positions are correctly mapped during training.
+    prompt_tokens: Optional[List[int]] = None
+
     @property
     def has_detailed_data(self) -> bool:
         """Check if we have token-level disagreement data."""
@@ -803,6 +810,7 @@ class ManualSpeculativeDecoder:
             prompt=prompt,
             disagreements=disagreements,
             is_failure_case=is_failure,
+            prompt_tokens=prompt_tokens,
         )
 
     def generate(
