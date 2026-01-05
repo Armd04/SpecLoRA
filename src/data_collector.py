@@ -67,6 +67,8 @@ class TokenLevelDisagreement:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TokenLevelDisagreement":
         """Create from dictionary."""
+        # Copy to avoid mutating the caller's dictionary
+        data = data.copy()
         # Handle backward compatibility: missing target_logits = None
         if "target_logits" in data and data["target_logits"] is not None:
             # Convert list of lists back to list of tuples
@@ -138,6 +140,8 @@ class TrainingExample:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TrainingExample":
         """Create from dictionary."""
+        # Copy to avoid mutating the caller's dictionary
+        data = data.copy()
         # Handle nested disagreements
         if data.get("disagreements") is not None:
             data["disagreements"] = [
