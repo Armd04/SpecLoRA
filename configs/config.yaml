@@ -50,10 +50,10 @@ training:
   
   # Training parameters
   # Tuned for small datasets (~30 prompts): lower LR, fewer epochs, smaller warmup
-  learning_rate: 5.0e-6
+  learning_rate: 4.0e-6
   batch_size: 1
-  gradient_accumulation_steps: 2
-  num_epochs: 2
+  gradient_accumulation_steps: 3
+  num_epochs: 3
   warmup_steps: 5
   
   # When to trigger training
@@ -63,7 +63,7 @@ training:
   
   # Replay buffer for successful cases (prevents catastrophic forgetting)
   replay_buffer_size: 25
-  replay_ratio: 0.3  # Slightly higher replay to stabilize small runs
+  replay_ratio: 0  # Slightly higher replay to stabilize small runs
   
   # Checkpointing
   save_every_n_steps: 50
@@ -72,9 +72,9 @@ training:
   # Loss function configuration
   loss:
     type: "kl_divergence"  # "cross_entropy" | "kl_divergence" | "mixed"
-    temperature: 2.0        # Softens distributions for KL (higher = softer)
+    temperature: 1.8        # Softens distributions for KL (higher = softer)
     alpha: 0.5             # For mixed: alpha * CE + (1-alpha) * KL
-    top_k_logits: 10       # Number of top logits to store per disagreement
+    top_k_logits: 30       # Number of top logits to store per disagreement
 
 # Data Collection
 data:
